@@ -3,7 +3,7 @@
 # (rexglue-sdk/.github/workflows/_build-platform.yaml). Binaries built here need glibc 2.35 and
 # libstdc++ GLIBCXX_3.4.32 (Ubuntu 24.04, Debian 13, Fedora 39, Arch or newer).
 # Used by tools/release/compat/build.sh.
-FROM ubuntu:24.04
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
