@@ -35,7 +35,13 @@ jobs:
         with:
           ref: perf-linux
           fetch-depth: 1
+          fetch-tags: true
           submodules: recursive
+
+      - name: Verify submodules
+        run: |
+          git submodule status --recursive
+          test -f thirdparty/cli11/CMakeLists.txt
 
       # --------------------------------------------------
       # Host dependencies
