@@ -38,10 +38,25 @@ jobs:
           fetch-tags: true
           submodules: recursive
 
-      - name: Verify submodules
+      - name: Diagnose CLI11
         run: |
-          git submodule status --recursive
-          test -f thirdparty/cli11/CMakeLists.txt
+          echo "=== Working directory ==="
+          pwd
+
+          echo "=== Git root ==="
+          git rev-parse --show-toplevel || true
+
+          echo "=== Submodule status ==="
+          git submodule status --recursive || true
+
+          echo "=== CLI11 directories ==="
+          find . -type d -name cli11 -print
+
+          echo "=== CLI11 CMakeLists ==="
+          find . -path '*/cli11/CMakeLists.txt' -print
+
+          echo "=== Gitmodules files ==="
+          find . -name .gitmodules -print
 
       # --------------------------------------------------
       # Host dependencies
