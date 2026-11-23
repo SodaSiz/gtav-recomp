@@ -1,0 +1,223 @@
+
+name: GTA V Recomp - Linux Portable
+
+on:
+  push:
+    branches:
+      - perf-linux
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Linux x86_64 Portable
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      SOURCE_VERSION: v0.3.0
+      SOURCE_SHA256: e0cc7ff6f045b8ff7b0f225178e8c800a66d2c774acd4e623e899e379eb5028c
+      LLVM_SHA256: 13e9975b026d431c945927960e5f8c0a47a155a2f600f57e85f4d1482620c65f
+      JOBS: 4
+
+    steps:
+      # --------------------------------------------------
+      # Checkout
+      # --------------------------------------------------
+      - name: Checkout perf-linux
+        uses: actions/checkout@v4
+        with:
+          ref: perf-linux
+          fetch-depth: 1
+          submodules: recursive
+
+      # --------------------------------------------------
+      # Host dependencies
+      # --------------------------------------------------
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            binutils \
+            ca-certificates \
+            curl \
+            git \
+            python3 \
+            xz-utils \
+            tar \
+            rsync
+
+      # --------------------------------------------------
+      # Download pinned upstream sources
+      # --------------------------------------------------
+
+      - name: Download official source archive
+        run: |
+          URL="https://github.com/andrewnakas/gtav-recomp/releases/download/v0.3.0/gtav-recomp-src-v0.3.0.tar.xz"
+
+          curl -fL --retry 3 "$URL" \
+            -o "$RUNNER_TEMP/gtav-source.tar.xz"
+
+          echo "$SOURCE_SHA256  $RUNNER_TEMP/gtav-source.tar.xz" \
+            | sha256sum -c -
+
+          mkdir -p "$RUNNER_TEMP/pinned-source"
+
+          tar -xJf "$RUNNER_TEMP/gtav-source.tar.xz" \
+            -C "$RUNNER_TEMP/pinned-source"
+
+          SOURCE_ROOT=$(find "$RUNNER_TEMP/pinned-source" \
+            -type f \
+            -path '*/tools/release/compat/build.sh' \
+            -print -quit)
+
+          if [ -z "$SOURCE_ROOT" ]; then
+            echo "Could not locate pinned source tree"
+            exit 1
+          fi
+
+          SOURCE_ROOT="${SOURCE_ROOT%/tools/release/compat/build.sh}"
+
+          echo "SOURCE_ROOT=$SOURCE_ROOT" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------
+      # Inject exact upstream dependencies
+      # --------------------------------------------------
+
+      - name: Install pinned dependencies
+        run: |
+          set -euo pipefail
+
+          test -d "$SOURCE_ROOT/rexglue-sdk"
+          test -d "$SOURCE_ROOT/thirdparty/XenosRecomp"
+
+          rm -rf rexglue-sdk
+          rm -rf thirdparty/XenosRecomp
+
+          mkdir -p thirdparty
+
+          cp -a "$SOURCE_ROOT/rexglue-sdk" ./rexglue-sdk
+
+          cp -a "$SOURCE_ROOT/thirdparty/XenosRecomp" \
+            ./thirdparty/XenosRecomp
+
+          # Plume, if included in the source archive.
+          if [ -d "$SOURCE_ROOT/thirdparty/plume" ]; then
+            rm -rf thirdparty/plume
+            cp -a "$SOURCE_ROOT/thirdparty/plume" \
+              ./thirdparty/plume
+          fi
+
+          # Check that the current branch has the required scripts.
+          test -f tools/release/compat/build.sh
+          test -f tools/release/make_release_linux.py
+          test -f tools/release/expected.txt
+
+      # --------------------------------------------------
+      # LLVM 19.1.5
+      # --------------------------------------------------
+
+      - name: Download LLVM 19.1.5
+        run: |
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/LLVM-19.1.5-Linux-X64.tar.xz"
+
+          curl -fL --retry 3 "$URL" \
+            -o "$RUNNER_TEMP/llvm.tar.xz"
+
+          echo "$LLVM_SHA256  $RUNNER_TEMP/llvm.tar.xz" \
+            | sha256sum -c -
+
+          tar -xJf "$RUNNER_TEMP/llvm.tar.xz" \
+            -C "$RUNNER_TEMP"
+
+          test -x "$RUNNER_TEMP/LLVM-19.1.5-Linux-X64/bin/clang-19"
+          test -x "$RUNNER_TEMP/LLVM-19.1.5-Linux-X64/bin/lld"
+
+      # --------------------------------------------------
+      # Third-party licenses
+      # --------------------------------------------------
+
+      - name: Prepare licenses
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/licenses/third_party"
+
+          curl -fL \
+            https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-19.1.5/llvm/LICENSE.TXT \
+            -o "$RUNNER_TEMP/licenses/LLVM.txt"
+
+          curl -fL \
+            https://raw.githubusercontent.com/microsoft/DirectXShaderCompiler/main/LICENSE.TXT \
+            -o "$RUNNER_TEMP/licenses/DirectXShaderCompiler.txt"
+
+          cp /usr/share/common-licenses/GPL-3 \
+            "$RUNNER_TEMP/licenses/third_party/GPL-3.0.txt"
+
+      # --------------------------------------------------
+      # Portable compilation
+      # --------------------------------------------------
+
+      - name: Build portable binaries
+        run: |
+          chmod +x tools/release/compat/build.sh
+
+          JOBS=4 tools/release/compat/build.sh
+
+      # --------------------------------------------------
+      # Package
+      # --------------------------------------------------
+
+      - name: Create Linux release package
+        run: |
+          python3 tools/release/make_release_linux.py \
+            "$RUNNER_TEMP/gtav-recomp-linux-x64" \
+            --llvm "$RUNNER_TEMP/LLVM-19.1.5-Linux-X64" \
+            --expected tools/release/expected.txt \
+            --licenses "$RUNNER_TEMP/licenses" \
+            --compat \
+            --tar
+
+      # --------------------------------------------------
+      # Verify
+      # --------------------------------------------------
+
+      - name: Verify package
+        run: |
+          set -euo pipefail
+
+          PACKAGE="$RUNNER_TEMP/gtav-recomp-linux-x64"
+
+          test -x "$PACKAGE/gtav_launcher"
+          test -x "$PACKAGE/gtav_fast"
+          test -x "$PACKAGE/rexglue"
+          test -x "$PACKAGE/tools/XenosRecomp"
+
+          test -f "$RUNNER_TEMP/gtav-recomp-linux-x64.tar.gz"
+
+          tar -tzf "$RUNNER_TEMP/gtav-recomp-linux-x64.tar.gz" \
+            | head -30
+
+          sha256sum "$RUNNER_TEMP/gtav-recomp-linux-x64.tar.gz"
+
+      # --------------------------------------------------
+      # Upload
+      # --------------------------------------------------
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtav-recomp-linux-x64
+          path: ${{ runner.temp }}/gtav-recomp-linux-x64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
