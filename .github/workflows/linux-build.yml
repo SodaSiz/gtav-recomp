@@ -93,33 +93,57 @@ jobs:
       # --------------------------------------------------
 
       - name: Install pinned dependencies
+        shell: bash
         run: |
           set -euo pipefail
 
-          test -d "$SOURCE_ROOT/rexglue-sdk"
-          test -d "$SOURCE_ROOT/thirdparty/XenosRecomp"
+          # The dependencies are siblings of gtav-recomp.
+          SOURCE_ARCHIVE_ROOT="$(dirname "$SOURCE_ROOT")"
 
+          echo "Source root: $SOURCE_ROOT"
+          echo "Archive root: $SOURCE_ARCHIVE_ROOT"
+
+          # Verify the actual archive structure.
+          for path in \
+            "$SOURCE_ARCHIVE_ROOT/rexglue-sdk" \
+            "$SOURCE_ARCHIVE_ROOT/XenosRecomp" \
+            "$SOURCE_ARCHIVE_ROOT/plume"
+          do
+            if [ ! -d "$path" ]; then
+              echo "::error::Missing dependency: $path"
+              echo "Archive contents:"
+              find "$SOURCE_ARCHIVE_ROOT" -maxdepth 3 -type d | sort
+              exit 1
+            fi
+          done
+
+          # Preserve perf-linux code, replace only dependencies.
           rm -rf rexglue-sdk
           rm -rf thirdparty/XenosRecomp
+          rm -rf thirdparty/plume
 
           mkdir -p thirdparty
 
-          cp -a "$SOURCE_ROOT/rexglue-sdk" ./rexglue-sdk
+          cp -a "$SOURCE_ARCHIVE_ROOT/rexglue-sdk" \
+            ./rexglue-sdk
 
-          cp -a "$SOURCE_ROOT/thirdparty/XenosRecomp" \
+          cp -a "$SOURCE_ARCHIVE_ROOT/XenosRecomp" \
             ./thirdparty/XenosRecomp
 
-          # Plume, if included in the source archive.
-          if [ -d "$SOURCE_ROOT/thirdparty/plume" ]; then
-            rm -rf thirdparty/plume
-            cp -a "$SOURCE_ROOT/thirdparty/plume" \
-              ./thirdparty/plume
-          fi
+          cp -a "$SOURCE_ARCHIVE_ROOT/plume" \
+            ./thirdparty/plume
 
-          # Check that the current branch has the required scripts.
+          # Verify the build inputs.
+          test -f rexglue-sdk/CMakeLists.txt
+          test -f thirdparty/XenosRecomp/CMakeLists.txt
+
+          # Required release scripts on perf-linux.
           test -f tools/release/compat/build.sh
           test -f tools/release/make_release_linux.py
           test -f tools/release/expected.txt
+
+          echo "Pinned dependency trees installed successfully."
+
 
       # --------------------------------------------------
       # LLVM 19.1.5
