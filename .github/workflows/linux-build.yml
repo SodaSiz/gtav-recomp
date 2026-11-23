@@ -37,27 +37,27 @@ jobs:
           fetch-depth: 1
           fetch-tags: true
           submodules: recursive
-
       - name: Diagnose source dependencies
+        shell: bash
         run: |
-          SOURCE_ROOT="/home/runner/work/_temp/pinned-source/gtav-recomp-src/gtav-recomp"
+          echo "=== Workspace ==="
+          pwd
 
-          echo "=== Source directory ==="
-          ls -la "$SOURCE_ROOT"
+          echo "=== Locate source CMakeLists ==="
+          find "$GITHUB_WORKSPACE" /home/runner/work/_temp \
+            -name CMakeLists.txt \
+            -not -path '*/.git/*' \
+            2>/dev/null | head -100
 
-          echo "=== Thirdparty CMake ==="
-          find "$SOURCE_ROOT" -name CMakeLists.txt -path '*/thirdparty/*'
+          echo "=== Locate source directories ==="
+          find "$GITHUB_WORKSPACE" /home/runner/work/_temp \
+            -type d -name thirdparty \
+            2>/dev/null
 
-          echo "=== CLI11 references ==="
-          grep -RIn --exclude-dir=.git 'cli11' "$SOURCE_ROOT" \
-            --include='CMakeLists.txt' \
-            --include='*.cmake' || true
-
-          echo "=== Git metadata ==="
-          find "$SOURCE_ROOT" -name .gitmodules -o -name .git -print
-
-          echo "=== CLI11 directories ==="
-          find "$SOURCE_ROOT" -iname '*cli11*'
+          echo "=== Locate CLI11 references ==="
+          grep -RIn --include='CMakeLists.txt' --include='*.cmake' \
+            'cli11' "$GITHUB_WORKSPACE" /home/runner/work/_temp \
+            2>/dev/null || true
 
       # --------------------------------------------------
       # Host dependencies
