@@ -38,25 +38,21 @@ jobs:
           fetch-tags: true
           submodules: recursive
 
-      - name: Diagnose CLI11
+      - name: Locate missing CLI11 dependency
         run: |
-          echo "=== Working directory ==="
-          pwd
+          echo "=== CMakeLists that checks submodules ==="
+          find . -path '*/thirdparty/CMakeLists.txt' -print
 
-          echo "=== Git root ==="
-          git rev-parse --show-toplevel || true
+          echo "=== CLI11 references ==="
+          grep -RIn --exclude-dir=.git 'cli11' . \
+            --include='CMakeLists.txt' \
+            --include='*.cmake' || true
 
-          echo "=== Submodule status ==="
-          git submodule status --recursive || true
+          echo "=== Git metadata ==="
+          find . -name .gitmodules -o -name .git -print
 
-          echo "=== CLI11 directories ==="
-          find . -type d -name cli11 -print
-
-          echo "=== CLI11 CMakeLists ==="
-          find . -path '*/cli11/CMakeLists.txt' -print
-
-          echo "=== Gitmodules files ==="
-          find . -name .gitmodules -print
+          echo "=== Tracked CLI11 files ==="
+          git ls-files '*cli11*' '*gitmodules*'
 
       # --------------------------------------------------
       # Host dependencies
