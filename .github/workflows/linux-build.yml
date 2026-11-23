@@ -38,21 +38,26 @@ jobs:
           fetch-tags: true
           submodules: recursive
 
-      - name: Locate missing CLI11 dependency
+      - name: Diagnose source dependencies
         run: |
-          echo "=== CMakeLists that checks submodules ==="
-          find . -path '*/thirdparty/CMakeLists.txt' -print
+          SOURCE_ROOT="/home/runner/work/_temp/pinned-source/gtav-recomp-src/gtav-recomp"
+
+          echo "=== Source directory ==="
+          ls -la "$SOURCE_ROOT"
+
+          echo "=== Thirdparty CMake ==="
+          find "$SOURCE_ROOT" -name CMakeLists.txt -path '*/thirdparty/*'
 
           echo "=== CLI11 references ==="
-          grep -RIn --exclude-dir=.git 'cli11' . \
+          grep -RIn --exclude-dir=.git 'cli11' "$SOURCE_ROOT" \
             --include='CMakeLists.txt' \
             --include='*.cmake' || true
 
           echo "=== Git metadata ==="
-          find . -name .gitmodules -o -name .git -print
+          find "$SOURCE_ROOT" -name .gitmodules -o -name .git -print
 
-          echo "=== Tracked CLI11 files ==="
-          git ls-files '*cli11*' '*gitmodules*'
+          echo "=== CLI11 directories ==="
+          find "$SOURCE_ROOT" -iname '*cli11*'
 
       # --------------------------------------------------
       # Host dependencies
