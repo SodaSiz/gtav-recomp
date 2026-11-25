@@ -1027,9 +1027,13 @@ class PipelineCompiler {
           Worker(device);
         }).detach();
     }
+    outstanding.fetch_add(1, std::memory_order_acq_rel);
     queue_.push_back(std::move(job));
     cv_.notify_one();
   }
+
+  // Jobs queued or compiling (the iPhone's pipeline warm-up waits while there are any).
+  std::atomic<int> outstanding{0};
 
  private:
   void Worker(RenderDevice* device) {
@@ -1044,6 +1048,7 @@ class PipelineCompiler {
       auto t0 = std::chrono::steady_clock::now();
       job->result = device->createGraphicsPipeline(job->desc);
       job->done.store(true, std::memory_order_release);
+      outstanding.fetch_sub(1, std::memory_order_acq_rel);
       double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       {
         std::lock_guard lock(mutex_);
@@ -1153,8 +1158,8 @@ class PipelineWarmer {
   static constexpr uint32_t kMagic = 0x32504C47;
 
   void Start(RenderDevice* device, const RenderPipelineLayout* layout, const RenderShader* gs,
-             std::filesystem::path file, std::string spirv_dir) {
-    device_ = device, layout_ = layout, gs_ = gs, spirv_dir_ = std::move(spirv_dir);
+             std::filesystem::path file, std::string spirv_dir, const std::atomic<int>* demand) {
+    device_ = device, layout_ = layout, gs_ = gs, spirv_dir_ = std::move(spirv_dir), demand_ = demand;
     std::error_code ec;
     std::filesystem::create_directories(file.parent_path(), ec);
     std::vector<uint8_t> data;
@@ -1282,7 +1287,20 @@ class PipelineWarmer {
 
   void Worker() {
     NameThread("gtav-pipeline");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // iPhone: after an update every saved pipeline compiles again (MoltenVK + Metal on an A15,
+    // 0.5-3 s each), and these four threads at the default class held the Metal compiler service
+    // while the frame's own compiles (USER_INTERACTIVE, PipelineCompiler) waited behind them: the
+    // first 0.5.0 launch skipped draws for 95 s, up to 1,446 of ~2,600 a frame. Below the frame's
+    // class, and no warm-up compile starts while one of the frame's is queued or running: the
+    // warm-up fills the time the frame does not need the compiler.
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
     for (;;) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+      while (demand_ && demand_->load(std::memory_order_acquire) > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+#endif
       std::shared_ptr<Record> rec;
       {
         std::lock_guard lock(mutex_);
@@ -1340,6 +1358,7 @@ class PipelineWarmer {
   RenderDevice* device_ = nullptr;
   const RenderPipelineLayout* layout_ = nullptr;
   const RenderShader* gs_ = nullptr;
+  const std::atomic<int>* demand_ = nullptr;  // the frame's compiles outstanding (iPhone: wait)
   std::string spirv_dir_;
   FILE* file_ = nullptr;
   std::mutex mutex_;
@@ -2828,7 +2847,8 @@ struct Backend::Impl {
     {
       std::string dir = REXCVAR_GET(gtav_native_spirv_dir);
       pipeline_warmer.Start(device, layout.get(), rect_gs ? rectlist_gs.get() : nullptr,
-                            ExeDir() / "shader_cache" / "pipelines.bin", dir.empty() ? DefaultSpirvDir() : dir);
+                            ExeDir() / "shader_cache" / "pipelines.bin", dir.empty() ? DefaultSpirvDir() : dir,
+                            &pipeline_compiler.outstanding);
     }
     return blit_vs && blit_ps && rectlist_gs && depth_copy_pipeline;
   }
