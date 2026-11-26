@@ -1,300 +1,201 @@
-name: GTA V Recomp - Linux Portable
+
+name: Build GTA V Recomp - Linux
 
 on:
   push:
     branches:
-      - perf-linux
+      - max-perf
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: linux-build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  build:
-    name: Build Linux x86_64 Portable
+  build-linux:
+    name: Build Linux x86_64
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
-
-    env:
-      LLVM_VERSION: 19.1.5
-      LLVM_SHA256: 13e9975b026d431c945927960e5f8c0a47a155a2f600f57e85f4d1482620c65f
-      JOBS: 4
+    timeout-minutes: 180
 
     steps:
-      # --------------------------------------------------
-      # 1. Checkout du véritable code source
-      # --------------------------------------------------
-
-      - name: Checkout perf-linux
+      - name: Checkout project
         uses: actions/checkout@v4
         with:
-          ref: perf-linux
-          fetch-depth: 0
-          fetch-tags: true
+          submodules: recursive
 
-      - name: Verify branch
+      - name: Install dependencies
         run: |
-          git status --short
-          echo "Commit: $(git rev-parse HEAD)"
-          echo "Branch: $(git branch --show-current)"
-          test "$(git branch --show-current)" = "perf-linux"
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            python3 \
+            python3-pip \
+            curl \
+            xz-utils \
+            pkg-config \
+            libvulkan-dev \
+            vulkan-tools \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libasound2-dev \
+            libpulse-dev \
+            libudev-dev \
+            libdbus-1-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            zlib1g-dev \
+            libbz2-dev \
+            liblzma-dev \
+            libzstd-dev \
+            libxml2-dev
 
-      # --------------------------------------------------
-      # 2. Récupération des dépendances externes
-      # --------------------------------------------------
-
-      - name: Checkout ReXGlue SDK
+      - name: Install LLVM 19.1.5
         run: |
-          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -L \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/LLVM-19.1.5-Linux-X64.tar.xz \
+            -o llvm.tar.xz
 
-          git clone \
-            --branch v0.10.0 \
-            --recurse-submodules \
+          mkdir -p "$RUNNER_TEMP/llvm"
+          tar -xf llvm.tar.xz \
+            --strip-components=1 \
+            -C "$RUNNER_TEMP/llvm"
+
+          echo "$RUNNER_TEMP/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch and prepare ReXGlue SDK
+        run: |
+          mkdir -p "$RUNNER_TEMP/deps"
+
+          git clone --recurse-submodules \
             https://github.com/rexglue/rexglue-sdk.git \
-            rexglue-sdk
+            "$RUNNER_TEMP/deps/rexglue-sdk"
 
-          echo "=== ReXGlue version ==="
-          git -C rexglue-sdk describe --tags --always
+          cd "$RUNNER_TEMP/deps/rexglue-sdk"
+          git checkout f5337cd
+          git submodule update --init --recursive
 
-          echo "=== ReXGlue submodules ==="
-          git -C rexglue-sdk submodule status --recursive
+          git apply "$GITHUB_WORKSPACE/rexglue-sdk-gtav-linux.patch"
 
-          if git -C rexglue-sdk submodule status --recursive | grep -q '^-'; then
-            echo "::error::ReXGlue has uninitialized submodules"
-            exit 1
-          fi
+          mkdir -p "$GITHUB_WORKSPACE/rexglue-sdk"
 
-          if ! find rexglue-sdk/thirdparty \
-            -type d -iname cli11 -print -quit | grep -q .; then
-            echo "::error::CLI11 was not found in ReXGlue"
-            exit 1
-          fi
+          cp LICENSE "$GITHUB_WORKSPACE/rexglue-sdk/LICENSE"
+          cp -a thirdparty "$GITHUB_WORKSPACE/rexglue-sdk/"
 
-      - name: Checkout XenosRecomp
+      - name: Build and install ReXGlue
         run: |
-          set -euo pipefail
+          cd "$RUNNER_TEMP/deps/rexglue-sdk"
 
-          mkdir -p thirdparty
+          cmake --preset linux-amd64 \
+            -DREXGLUE_ENABLE_TRACY=ON \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/rexglue-sdk/out/install/linux-amd64"
 
+          cmake --build out/build/linux-amd64 --parallel 2
+
+          cmake --install out/build/linux-amd64
+
+      - name: Fetch and prepare XenosRecomp
+        run: |
           git clone --recurse-submodules \
             https://github.com/hedge-dev/XenosRecomp.git \
-            thirdparty/XenosRecomp
+            "$RUNNER_TEMP/deps/XenosRecomp"
 
-          echo "XenosRecomp commit:"
-          git -C thirdparty/XenosRecomp rev-parse HEAD
+          cd "$RUNNER_TEMP/deps/XenosRecomp"
+          git checkout 990d03b
+          git submodule update --init --recursive
 
-          git -C thirdparty/XenosRecomp apply --check \
-            "$GITHUB_WORKSPACE/xenosrecomp-gtav.patch"
+          git apply "$GITHUB_WORKSPACE/xenosrecomp-gtav.patch"
 
-          git -C thirdparty/XenosRecomp apply \
-            "$GITHUB_WORKSPACE/xenosrecomp-gtav.patch"
+          mkdir -p "$GITHUB_WORKSPACE/thirdparty"
+          cp -a "$RUNNER_TEMP/deps/XenosRecomp" \
+            "$GITHUB_WORKSPACE/thirdparty/XenosRecomp"
 
-      - name: Checkout Plume
+      - name: Fetch and prepare Plume
         run: |
-          set -euo pipefail
-
           git clone --recurse-submodules \
             https://github.com/renderbag/plume.git \
-            thirdparty/plume
+            "$RUNNER_TEMP/deps/plume"
 
-          echo "Plume commit:"
-          git -C thirdparty/plume rev-parse HEAD
+          cd "$RUNNER_TEMP/deps/plume"
+          git checkout 0ce184b
+          git submodule update --init --recursive
 
-          git -C thirdparty/plume apply --check \
-            "$GITHUB_WORKSPACE/plume-gtav.patch"
+          git apply "$GITHUB_WORKSPACE/plume-gtav.patch"
 
-          git -C thirdparty/plume apply \
-            "$GITHUB_WORKSPACE/plume-gtav.patch"
+          cp -a "$RUNNER_TEMP/deps/plume" \
+            "$GITHUB_WORKSPACE/thirdparty/plume"
 
-      # --------------------------------------------------
-      # 3. Application du patch ReXGlue
-      # --------------------------------------------------
-
-      - name: Patch ReXGlue SDK
+      - name: Build XenosRecomp
         run: |
-          set -euo pipefail
+          cmake -S thirdparty/XenosRecomp \
+            -B build/xenosrecomp \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
 
-          git -C rexglue-sdk apply --check \
-            "$GITHUB_WORKSPACE/rexglue-sdk-gtav-linux.patch"
+          cmake --build build/xenosrecomp \
+            --target XenosRecomp \
+            --parallel 2
 
-          git -C rexglue-sdk apply \
-            "$GITHUB_WORKSPACE/rexglue-sdk-gtav-linux.patch"
-
-          echo "=== Dependencies verification ==="
-
-          test -f rexglue-sdk/CMakeLists.txt
-          test -f rexglue-sdk/thirdparty/CMakeLists.txt
-
-          if git -C rexglue-sdk submodule status --recursive | grep -q '^-'; then
-            echo "::error::A ReXGlue submodule is still missing"
-            exit 1
-          fi
-
-          echo "All external sources are ready."
-
-      - name: Display dependency revisions
+      - name: Build GTA V runtime
         run: |
-          echo "=== Dependency revisions ==="
-          git -C rexglue-sdk rev-parse HEAD
-          git -C thirdparty/XenosRecomp rev-parse HEAD
-          git -C thirdparty/plume rev-parse HEAD
+          cmake -S gtav -B build-dll -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_LINKER="$(command -v ld.lld)" \
+            -DGTAV_GAME_DLL=ON \
+            -Drexglue_DIR="$GITHUB_WORKSPACE/rexglue-sdk/out/install/linux-amd64/lib/cmake/rexglue" \
+            -DSDL3_DIR="$GITHUB_WORKSPACE/rexglue-sdk/out/install/linux-amd64/lib/cmake/SDL3"
 
-      # --------------------------------------------------
-      # 4. Host tools
-      # --------------------------------------------------
+          cmake --build build-dll --parallel 2
 
-      - name: Verify host tools
+      - name: Build launcher
         run: |
-          docker --version
-          git --version
-          cmake --version
-          python3 --version
-          curl --version
-          readelf --version
-          ninja --version
+          cmake -S loader -B build-launcher -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++
 
-      # --------------------------------------------------
-      # 5. LLVM 19.1.5 pour le package final
-      # --------------------------------------------------
+          cmake --build build-launcher --parallel 2
 
-      - name: Download LLVM 19.1.5
-        shell: bash
+      - name: Package Linux release
         run: |
-          set -euo pipefail
-
-          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
-
-          curl -fL --retry 5 --retry-all-errors \
-            "$URL" \
-            -o "$RUNNER_TEMP/llvm.tar.xz"
-
-          echo "$LLVM_SHA256  $RUNNER_TEMP/llvm.tar.xz" \
-            | sha256sum -c -
-
-          tar -xJf "$RUNNER_TEMP/llvm.tar.xz" \
-            -C "$RUNNER_TEMP"
-
-          LLVM_DIR="$RUNNER_TEMP/LLVM-${LLVM_VERSION}-Linux-X64"
-
-          test -x "$LLVM_DIR/bin/clang-19"
-          test -x "$LLVM_DIR/bin/lld"
-
-          echo "LLVM_DIR=$LLVM_DIR" >> "$GITHUB_ENV"
-
-      # --------------------------------------------------
-      # 6. Licences
-      # --------------------------------------------------
-
-      - name: Prepare licenses
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$RUNNER_TEMP/licenses/third_party"
-
-          curl -fL --retry 5 \
-            https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-19.1.5/llvm/LICENSE.TXT \
-            -o "$RUNNER_TEMP/licenses/LLVM.txt"
-
-          curl -fL --retry 5 \
-            https://raw.githubusercontent.com/microsoft/DirectXShaderCompiler/main/LICENSE.TXT \
-            -o "$RUNNER_TEMP/licenses/DirectXShaderCompiler.txt"
-
-          cp /usr/share/common-licenses/GPL-3 \
-            "$RUNNER_TEMP/licenses/third_party/GPL-3.0.txt"
-
-      # --------------------------------------------------
-      # 7. Construction de l'image Docker portable
-      # --------------------------------------------------
-
-      - name: Build compatibility Docker image
-        run: |
-          docker build --pull \
-            -t gtav-compat-build:22.04 \
-            tools/release/compat
-
-      # --------------------------------------------------
-      # 8. Compilation complète
-      # --------------------------------------------------
-
-      - name: Build portable binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x tools/release/compat/build.sh
-
-          JOBS="$JOBS" tools/release/compat/build.sh
-
-      # --------------------------------------------------
-      # 9. Création du package Linux
-      # --------------------------------------------------
-
-      - name: Create Linux release package
-        run: |
-          set -euo pipefail
-
           python3 tools/release/make_release_linux.py \
-            "$RUNNER_TEMP/gtav-recomp-linux-x64" \
-            --llvm "$LLVM_DIR" \
+            release-linux \
+            --llvm "$RUNNER_TEMP/llvm" \
             --expected tools/release/expected.txt \
-            --licenses "$RUNNER_TEMP/licenses" \
-            --compat \
+            --licenses licenses \
             --tar
 
-      # --------------------------------------------------
-      # 10. Vérification du package
-      # --------------------------------------------------
-
-      - name: Verify package
-        shell: bash
+      - name: Check release files
         run: |
-          set -euo pipefail
+          test -f release-linux.tar.gz
+          test -x release-linux/gtav_launcher
+          test -x release-linux/gtav_fast
 
-          PACKAGE="$RUNNER_TEMP/gtav-recomp-linux-x64"
+          file release-linux/gtav_launcher
+          file release-linux/gtav_fast
 
-          for file in \
-            gtav_launcher \
-            gtav_fast \
-            librexruntime.so \
-            librexgpu-xenos.so \
-            libTracyClient.so \
-            rexglue \
-            tools/XenosRecomp \
-            tools/dxc \
-            tools/dxc-linux \
-            tools/lib/libdxcompiler.so \
-            tools/llvm/bin/clang++ \
-            tools/llvm/bin/ld.lld \
-            tools/llvm/lib/libxml2.so.2
-          do
-            if [ ! -x "$PACKAGE/$file" ]; then
-              echo "::error::Missing executable: $file"
-              exit 1
-            fi
-          done
+          ldd release-linux/gtav_launcher
+          ldd release-linux/gtav_fast
 
-          test -f "$RUNNER_TEMP/gtav-recomp-linux-x64.tar.gz"
-
-          echo "=== Package contents ==="
-          tar -tzf "$RUNNER_TEMP/gtav-recomp-linux-x64.tar.gz" \
-            | sed -n '1,40p'
-
-          echo "=== SHA256 ==="
-          sha256sum "$RUNNER_TEMP/gtav-recomp-linux-x64.tar.gz"
-
-      # --------------------------------------------------
-      # 11. Upload
-      # --------------------------------------------------
-
-      - name: Upload Linux artifact
+      - name: Upload Linux release
         uses: actions/upload-artifact@v4
         with:
           name: gtav-recomp-linux-x64
-          path: ${{ runner.temp }}/gtav-recomp-linux-x64.tar.gz
+          path: release-linux.tar.gz
           if-no-files-found: error
           compression-level: 0
-          retention-days: 14
+          retention-days: 30
