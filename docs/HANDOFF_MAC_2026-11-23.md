@@ -266,7 +266,7 @@ a visible window and the iPhone's are the owner's to take.
 
 Uploads to the draft `v0.5.0`:
 
-- `gtav-recomp-macos-arm64.zip`, 195,560,842 bytes, SHA-256
+- (Replaced on 11-26 by the `34fc528` zip, see the last section.) `gtav-recomp-macos-arm64.zip`, 195,560,842 bytes, SHA-256
   `e1d5e6f27f90401954e39b6533e1f41ff47f6ef030707f4d958cea27d1bf94e8`. Binaries built from
   `75fbe60` with a clean tree; packaged by `9aba5e8`'s `make_release_macos.py`. Its `android/` is
   the published `GTAV.apk` (SHA-256 `0856e2fc...e615`).
@@ -323,3 +323,46 @@ fails on a source that is missing, unreadable or yields nothing. **Linux:** `sca
 default GENERATED_DIR (`~/gtav-e2e-linux-cg/generated/default`) does not exist on the 4050, so
 pass it explicitly or the scan now stops there. That repackaged zip was not uploaded; the draft
 still holds the `75fbe60` zip.
+
+### iPhone fix measured, PR #49 in, new Mac zip on the draft (11-26)
+
+**iPhone A/B** (13 mini, both launches from the pre-update pipeline files with the Metal cache
+emptied, muted, one launch each; the owner was playing during the test launch, so the scenes
+differ):
+
+| | 0.5.0 as shipped | warm-up gives way (`e15a470`) |
+|---|---|---|
+| frames with 100+ draws missing | +34 s to +128 s | +34 s to +88 s |
+| most draws missing in a frame | 1,794 | 1,569 |
+| the frame's compiles, average per 50 | 1.3-3.4 s | 1.0-1.9 s |
+| first 250 of the frame's compiles done | 172 s after launch | 96 s after launch |
+| frame rate while compiling | 17-20 | 15-22 |
+
+The change helps but does not remove the storm: the frame still needs about 300 pipelines on the
+first launch after an update, and the phone's Metal compiler takes about a second each. `e15a470`
+is pushed. The test launch ran 11 minutes (thermal "serious" from minute 9) and its log then
+stops with no "background" line; several 0.3.0 launches on 11-01 ended the same way, and no
+crash report could be pulled over the network connection. The phone now runs that test build
+(0.5.0's `ios/` with only `gtav` rebuilt at `e15a470`); its iPhone code is the same as
+`34fc528`'s.
+
+**PR #49:** the fullscreen fix, guarded for the phones, is `34fc528` on max-perf (author kept).
+The Mac package with it booted hidden from the existing save for 420 s, city at ~50 fps, no
+errors. The first boot attempt crashed ~15 s into loading (guest read of 0): the WD drive came
+back as `/Volumes/Untitled` and nine links of the test install still pointed at
+`/Volumes/Untitled 1` (the disc-2 `part*.rpf`), not the change. The PR itself is still not
+merged, commented on or closed.
+
+**New Mac zip on the draft** `v0.5.0`: built from `34fc528` (clean tree) by rebuilding the release
+trees `tools/release/build_release_macos.sh` had configured (only `renderer.cpp` and `backend.cpp`
+recompiled, for the Mac and the iPhone shell; launcher identical apart from its signature;
+iPhone interface and exports identical), `make_shell.sh`, then `make_release_macos.py`.
+`gtav-recomp-macos-arm64.zip`, 195,560,880 bytes, SHA-256
+`0c16164e6da853d1b45eeeb616ffcc61efb638e03cd3e24f5199a1dd61cdd979` (GitHub's digest matches).
+Unzipped: test 13 again (hidden, muted, existing save, 420 s, no errors; ~50 fps until the
+Mac's load average went past 100 from other jobs). Taint scan (strict) PASS: 1,326 files,
+558 MB of sources read, 0 failing.
+
+`ios-shell-v0.5.0.tar` rebuilt from `34fc528` (29,650,432 bytes, SHA-256
+`0fb279d901d11ac708e6aaae7ce9247e96c9f37210b77bf2997ce5f3b10c5193`, owner names root/wheel),
+same file list as the `75fbe60` tar. **Still not uploaded**: it waits for test 11 on the phone.
