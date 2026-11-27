@@ -2856,8 +2856,21 @@ struct Backend::Impl {
   // Direct-mapped memo in front of `samplers` (the find was 3% of the render thread, 11-15 profile:
   // ~1,400 slot lookups a frame, a few dozen distinct samplers).
   std::array<std::pair<uint64_t, uint32_t>, 256> sampler_memo{};
+  bool sampler_full_logged = false;
   uint32_t Sampler(const RenderSamplerDesc& desc) {
-    uint64_t h = Hash(&desc, sizeof(desc));
+    // Field by field: the struct has padding after its two bools that nothing initialises, so a
+    // hash of its bytes can make the same sampler a new one when the stack under it differs, and
+    // past kSamplerDescriptors of them every new sampler becomes sampler 0. (Not seen happening:
+    // the iPhone had 32-63 samplers after seven minutes, 11-27. The count is logged as it grows.)
+    const uint32_t fields[] = {uint32_t(desc.minFilter),      uint32_t(desc.magFilter),
+                               uint32_t(desc.mipmapMode),     uint32_t(desc.addressU),
+                               uint32_t(desc.addressV),       uint32_t(desc.addressW),
+                               std::bit_cast<uint32_t>(desc.mipLODBias), desc.maxAnisotropy,
+                               uint32_t(desc.anisotropyEnabled), uint32_t(desc.comparisonFunc),
+                               uint32_t(desc.comparisonEnabled), uint32_t(desc.borderColor),
+                               std::bit_cast<uint32_t>(desc.minLOD), std::bit_cast<uint32_t>(desc.maxLOD),
+                               uint32_t(desc.shaderVisibility)};
+    uint64_t h = Hash(fields, sizeof(fields));
     auto& memo = sampler_memo[(h >> 40) & (sampler_memo.size() - 1)];
     if (memo.first == h && h) return memo.second;
     auto it = samplers.find(h);
@@ -2866,7 +2879,12 @@ struct Backend::Impl {
       return it->second;
     }
     uint32_t index = uint32_t(sampler_objects.size());
-    if (index >= kSamplerDescriptors) return 0;
+    if (index >= kSamplerDescriptors) {
+      if (!sampler_full_logged) REXLOG_WARN("[native] all {} samplers are in use: new ones fall back to sampler 0", index);
+      sampler_full_logged = true;
+      return 0;
+    }
+    if (index >= 32 && std::has_single_bit(index)) REXLOG_INFO("[native] {} samplers created", index);
     sampler_objects.push_back(device->createSampler(desc));
     sampler_set->setSampler(index, sampler_objects.back().get());
     samplers[h] = index;
@@ -3558,6 +3576,7 @@ struct Backend::Impl {
       uint32_t topology, count, spec, msaa, diag, colorless;
       uint32_t formats[5];
       uint32_t depthcontrol, blend[4], mask, stencil[2], mode, alpha_to_mask;
+      uint32_t pad;  // explicit (the struct is hashed as bytes; the keys are saved in pipelines.bin)
     } k{};
     k.vs = d.vs_hash;
     k.ps = d.ps_hash ^ (TileOverride(d.ps_hash) ? 1ull << 62 : 0);
@@ -4937,6 +4956,7 @@ struct Backend::Impl {
       struct SiteKey {
         uint64_t layout, vs;
         uint32_t start, count, base_vertex, index_address, indexed;
+        uint32_t pad = 0;  // explicit: hashed as bytes, and the initialiser below left the padding as it was
       } k{decl.layout_hash, rec.rect_share ? reinterpret_cast<uintptr_t>(&decl) ^ uint64_t(rec.indirect) : d.vs_hash,
           d.start, d.count, uint32_t(d.base_vertex), d.index_address, d.indexed};
       rec.rect_site = Hash(&d.streams, sizeof(d.streams), Hash(&k, sizeof(k)));
