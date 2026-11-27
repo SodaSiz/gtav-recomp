@@ -1354,10 +1354,13 @@ class Installer {
  private:
   // The app's own args.txt (the SDK reads it before Documents/args.txt). No data roots: the setup
   // screen installs the game data into Documents/data (gtav_app.h OnFinalizePaths).
+  // Uncapped since 11-27 (it was 30 fps with vsync): the 13 mini runs 37-45 fps where the GPU
+  // allows. "Best image" in the menu is the steady 30 with vsync, and what the player picks
+  // there is kept in gtav_settings.ini, which is applied over these.
   static constexpr char kIphoneArgs[] =
       "--gpu_plugin=xenos --headless=true\n"
       "--gtav_native=on --gpu_skip_rendering=true --gpu_skip_rendering_lag_ms=6\n"
-      "--vsync=false --gtav_native_vsync=true --gtav_fps_limit=30\n"
+      "--vsync=false --gtav_native_vsync=false --gtav_fps_limit=0\n"
       "--audio_device_frames=256\n"
       "--log_level=info --log_file=logs/gtav.log --log_max_file_size_mb=16 --log_max_files=2\n"
       "--gtav_native_texture_budget_mb=192\n"
