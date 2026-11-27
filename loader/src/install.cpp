@@ -1182,9 +1182,11 @@ class Installer {
     if (ios_) {
       // iPhone, from any host: arm64 iOS 17, A14 or newer. The SSE intrinsics map to NEON through
       // simde (MIT, package ios/include), as on the Mac.
+      // REX_FP_SINGLE_MODE as on Android (the other arm64 phone build): no denormal-mode switch
+      // (an FPCR write) around FP instruction groups (fs/gtav_pch.h).
       flags = {L"--target=arm64-apple-ios17.0", L"-nostdinc++", L"-nostdlibinc", L"-fno-stack-protector",
                L"-O2", L"-std=gnu++23", L"-mcpu=apple-a14", L"-fno-exceptions", L"-fno-rtti",
-               L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w", L"-isystem",
+               L"-fno-threadsafe-statics", L"-fno-math-errno", L"-DREX_FP_SINGLE_MODE", L"-w", L"-isystem",
                (root_ / L"ios" / L"include").wstring()};
     } else if (android_) {
       // Android phones, from any host: aarch64, API 30, ARMv8.2 (LSE atomics; Snapdragon 845 and

@@ -270,8 +270,8 @@ endif()
 # The call-count probes hook all 2,888 functions of the D3D runtime (src/native/d3d_probe.cpp, a
 # tool for naming them). With a separately built game library every one of those calls then leaves
 # the library and comes back (two PLT jumps and the probe's test). The max-performance line builds
-# without them on Linux and Android; -DGTAV_D3D_PROBES=ON brings the tool back.
-if(WIN32 OR APPLE)
+# without them on Linux, Android and the iPhone; -DGTAV_D3D_PROBES=ON brings the tool back.
+if(WIN32 OR (APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS"))
     option(GTAV_D3D_PROBES "Hook every D3D runtime function for --gtav_d3d_probe" ON)
 else()
     option(GTAV_D3D_PROBES "Hook every D3D runtime function for --gtav_d3d_probe" OFF)
