@@ -1032,6 +1032,7 @@ struct PipelineJob {
   RenderSpecConstant specs[2];
   std::unique_ptr<RenderPipeline> result;
   std::atomic<bool> done{false};
+  uint64_t vs = 0, ps = 0;  // shader hashes, for the slow-compile line
 };
 
 class PipelineCompiler {
@@ -1080,6 +1081,10 @@ class PipelineCompiler {
       job->done.store(true, std::memory_order_release);
       outstanding.fetch_sub(1, std::memory_order_acq_rel);
       double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      // One compile took 16 s on the 13 mini (11-27, 45 minutes in, hot), the frame held 5 s and
+      // then lost that draw for 11 s more: which pipelines are that slow, and whether it repeats.
+      if (ms >= 2000)
+        REXLOG_INFO("[native] slow pipeline compile: {:.0f} ms (vs {:016X} ps {:016X})", ms, job->vs, job->ps);
       {
         std::lock_guard lock(mutex_);
         stat_ms_ += ms;
@@ -4002,6 +4007,8 @@ struct Backend::Impl {
     stat_pipelines_created++;
     if (REXCVAR_GET(gtav_native_async_pipelines) && !dumping) {
       auto job = std::make_shared<PipelineJob>();
+      job->vs = vs_hash;
+      job->ps = ps ? ps_hash : 0;
       job->elements = std::move(elements);
       job->slots = std::move(slots);
       job->spec = sc;
