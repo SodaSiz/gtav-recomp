@@ -366,3 +366,145 @@ Mac's load average went past 100 from other jobs). Taint scan (strict) PASS: 1,3
 `ios-shell-v0.5.0.tar` rebuilt from `34fc528` (29,650,432 bytes, SHA-256
 `0fb279d901d11ac708e6aaae7ce9247e96c9f37210b77bf2997ce5f3b10c5193`, owner names root/wheel),
 same file list as the `75fbe60` tar. **Still not uploaded**: it waits for test 11 on the phone.
+
+### iPhone speed and flicker (night of 11-27)
+
+Owner's goal: about 40 fps in game with no flickering on the 13 mini; picture quality may go down
+if a Quality option stays; uncapped. Eight commits on `max-perf`, `73b16a0` to `23a8dfe`. Every
+number below is from the game's own log on the phone (muted, the owner's settings file ignored
+unless said), default 960x540 internal resolution, uncapped.
+
+**Result.** One launch each; a launch brings the character in with a different switch scene every
+time, which is most of the spread between launches:
+
+| | before (11-25/26, 30 fps cap) | now |
+|---|---|---|
+| standing, light start scenes (1,830-2,140 draws) | 25-33 | 44.7-45.5 fps |
+| standing, the heaviest start scene (2,460-2,960 draws) | | 27.3-30.0 fps |
+| scripted walk (60-70 s windows, three launches) | 7-19 moving | 37.1-39.1, 38.8-40.8 |
+| frames shown with draws missing, warm Metal cache | minutes of them after installs | 0 in seven launches, incl. 19.5 min of walking |
+
+40 fps holds where the scene is light and for the first minutes; the phone reaches thermal state
+"serious" about 3 minutes into a run and the same scene then costs about a third more GPU time.
+
+**What made the difference** (commit, measured effect):
+- `adcda53` the game code built with `-DREX_FP_SINGLE_MODE` (as on Android) and the shell without
+  the D3D probes: recording 7.6 -> 5.6 ms per 1,000 draws, all threads 169-173 -> 140-150 CPU-ms
+  a frame at 3,200-3,600 draws.
+- `d45998f` interlocked operations without the global lock (+3.3% standing, 2 of 2 report lines)
+  and fence waits that sleep (+3.7%, 2 of 2).
+- `c66f004` the flicker: warm-up ordered by recent use, a start-up gate, the last complete frame
+  held up to 5 s while pipelines compile, and a counter in the log for every frame that reached
+  the screen incomplete. `6fef3f8` sampler key (a way to fail removed; not seen failing).
+- `23a8dfe` uncapped launch arguments; both presets keep the per-pixel sun shadows and GPU lag 6
+  on the iPhone; `gtav_settings.ini` gets `settings_version=2` and an older file is corrected once
+  (the dev phone's had the shadows off and lag 4 from the "Max performance" button: checked, the
+  file on the phone now reads version 2, shadows on, lag 6).
+
+**Tried and left off, with the numbers:**
+- Anonymous guest memory (`869b6d0`, `--ios_guest_memory=file|anon|phys|auto`): page-ins while
+  walking 114-624 a second -> 2-16, but 280 MB more footprint (1,993 MB against 1,713; headroom
+  down to 354 MB after 3.5 minutes) and no frame rate for it (35.3 / 31.6 / 26.5 fps in that
+  launch). Default stays `file`; `auto` picks anon only from 3,000 MB of headroom (not a 4 GB
+  phone; that line is not measured).
+- A lower internal resolution. Same-run A/B with a flat pixel shader on every draw: 19.9 -> 19.3
+  ms of GPU a frame. The GPU's time is per render pass and per draw (162-190 passes a frame), not
+  in the pixels, so no resolution option went into the menu. One start at scale 0.5: 9.4-9.6 GPU
+  ms per 1,000 draws against 8.3-12 at 0.75.
+- Settings A/Bs that changed nothing or lost: copy resolves (-3.3%), guest poll patience,
+  hash threads 3|0 (+2.5% standing, -4.2% hot), record workers, draw clears, load clears
+  (-2.8%), keep targets, cube map every 2nd frame (-3.6%), sun shadows on|off 24.3|24.5, GPU lag
+  6|4 21.8|22.3.
+
+**Soak** (final build, 06:08, a scripted walk that turns the camera: beach, a shop, a respawn,
+downtown, a rainy freeway; screenshot every 20 s, all correct):
+
+| minutes | fps | draws | GPU ms | headroom min | thermal |
+|---|---|---|---|---|---|
+| 2-7 | 39.8 | 2,674 | 21.5 | 623 MB | fair -> serious |
+| 7-12 | 35.1 | 2,310 | 24.9 | 626 MB | serious |
+| 12-17 | 25.6 | 2,537 | 33.4 | 587 MB | serious |
+| 17-19.5 | 21.3 | 1,750 | 45.5 | 594 MB | serious |
+
+0 frames shown with draws missing; 13 holds, the longest 3.1 s (a new area). The frame rate
+halves with heat: GPU time per 1,000 draws went 8 -> 26 ms. **The game then ended, 19.5 minutes
+in, with no crash report and no jetsam report**, 653 MB of headroom in the last memory line, a
+burst of 60-160 ms frames in its last seconds. Two earlier long runs ended the same way (11-27
+03:28 after 12.5 minutes; the 11-26 test launch after 11 minutes), all hot. Nothing in the game
+or the SDK exits without logging first. Not solved; a build that logs iOS's thermal changes and
+memory warnings as they happen is being tested.
+
+**Soaks 2 and 3** (08:14 and 08:55, same walk, builds that log iOS's signals and, while hot or
+short of memory, a once-a-second memory line split into Metal / malloc / compressed / file):
+
+- Soak 2 ended 22 minutes in the same silent way, and the log now shows how: CPU memory
+  (malloc) rose by 420 MB within 9 s while Metal stayed flat, iOS sent two memory warnings
+  (464 MB left), and the log stopped 4 s later. Earlier in that run the GPU frame went from
+  ~21 ms to 200-265 ms for 12 minutes (4 fps) with the character facing the sun at sunset: one
+  extra effect (+3 clears, +4 resolves, +1 target), not heat. Not seen again since; the renderer
+  now times its passes by itself when the GPU frame averages over 80 ms (`5258304`).
+- Soak 3 ran **62 minutes** and was still running when stopped by hand. fps by 5-minute window:
+  36.7, 34.1, 27.5, then 30.6 over the last 47 minutes (thermal serious from minute 2, charging,
+  battery 60 -> 50%). Lowest headroom 598 MB. Two transient malloc spikes: +256 MB for about a
+  second at minute 35 (memory warnings at 464 MB left; back to normal a second later) and +66 MB
+  at minute 60. Same signature as soak 2's end, only shorter. Both came during runs of 60-365 ms
+  frames. Which code allocates is not known yet: a build that logs every allocation of 24 MB or
+  more with its call stack (`--gtav_native_big_alloc_mb`, off by default) is in soak 4.
+- Flicker in soak 3: 0 frames with draws missing for 45 minutes, then 273 in one burst
+  (minute 45): one pipeline took about 16 s to compile (others average 83 ms), the hold ran its
+  5 s and then that one draw (1,896 indices) was missing for 11 s. Holds otherwise 0.02-2.7 s,
+  about one every 2-3 minutes once hot. Compiles of 2 s or more are now logged with their shaders.
+
+**Soaks 4-7: the malloc spikes were fence copies** (10:18-13:00, same walk, the big-allocation
+log on at 24 MB):
+
+- The logger (`6f1b29b`) showed what allocates: fence-copy arenas growing to 32, 64 and 128 MB in
+  `FenceFlush`. A fence copy keeps a draw's vertex data for the frame the game is still building
+  when it waits on a fence mid-frame; normally 0-2 draws per 300 frames, in bursts 160-310 MB per
+  300 frames (up to 11,684 draws). The fence arenas shared the packet arenas' size memory (64 MB),
+  so every new one started at 64 MB, and big ones were kept as spares.
+- `dc59509`: fence arenas start at 1 MB with no shared peak, spares over 32 MB are freed, and a
+  budget for fence copies (`gtav_native_fence_copy_budget_mb`, 96 on the iPhone, 0 = none
+  elsewhere). Its first version (soak 6) still started each arena at the old peak, so frames with
+  copies allocated and freed 64 MB up to 270 times a minute; fixed in the same commit.
+- Soak 7 (`dc59509`, 36.6 minutes): iOS sent two memory warnings, with our malloc flat (690 and
+  677 MB) and 944 / 878 MB available: the system's pressure, not a spike of ours (soaks 2 and 3:
+  +256-420 MB within seconds before each). Lowest available 734 MB. 64 MB arenas 29 times in 37
+  minutes (soak 6: up to 270 a minute). fps by 5-minute window: 38.7, 30.7, 30.9, 26.3, 20.5,
+  23.2, 31.1, 28.9 (thermal serious throughout, charging at 40%).
+- The budget never triggered in soaks 6 and 7 (it counted bytes used), yet one burst still grew an
+  arena to 128 MB (64 + 128 MB held during the copy). It now counts memory held, with the
+  arena's next doubling once it is past half full, so no fence arena passes 64 MB. Soak 8 (40
+  minutes, the full run): no 128 MB allocation, 64 MB 9 times, 0 memory warnings, lowest
+  available 879 MB; the budget held back copies in 5 of 237 report windows (11,843 draws), all in
+  the first 2.5 minutes (loading and the first switch scene), none while walking. fps by
+  5-minute window: 34.5, 29.7, 31.7, 26.8, 24.4, 26.2, 26.8, 31.8.
+- Soaks 6 and 7 ended with "app in the background" (12:00:41 and 12:56:08) while the owner was
+  using the phone; not a crash. No JetsamEvent reports exist on the phone after 11-11, so the
+  silent ends of soak 1, soak 2 and the 11-26 test launch are put down to these spikes by their
+  log signature, not by a report.
+
+**Cold Metal cache** (`GTAV_IOS_CLEAR_METAL_CACHE=1`, one launch, with a 3 s hold): a compile takes
+0.9-1.0 s on average; the 409 pipelines of the last three runs were ready after 177 s; the boot
+screens were held 15.8, 1.1 and 3.4 s; walking into a new area gave holds of 1.5, 3.0 and 2.2 s
+and one burst of 8 frames with draws missing behind a 3.4 s compile (hence 5 s now, not measured
+again). **Open:** while the rest of the list recompiles (2,300 pipelines, four threads at the
+utility class, about 18 minutes of running) the game runs late: 26 fps walking against 39-41, and
+21 fps standing in the launch after. An app update keeps Metal's cache (three installs that
+night: the whole list ready in 1-9 s); a release that changes the shaders does not.
+
+**Next for the frame rate** (not done): fewer render passes. The in-pass (framebuffer fetch)
+resolves are off on the iPhone because they strobed white (`dbc731d`); they are about 45 passes a
+frame, plus 14 writeback compute passes; the G-buffer and the lighting target are each entered 8
+times a frame. Skipping every resolve (which breaks the picture) is worth 21.8 -> 19.5 ms. Then
+heat: the phone throttles within minutes, and a quality step-down by thermal state does not
+exist yet.
+
+**How it was measured:** `--gtav_native_ab=name=a|b` flips a live setting every 60 frames and
+prints both sides (set while running through `Documents/logs/menu_set`); `--input_script` walks
+the character (the file is reloaded when its modification time changes: `devicectl copy to` keeps
+the source's time, so push a freshly dated copy and look for a second "input script: N steps"
+line); `GTAV_NATIVE_SHOT_DIR` + `GTAV_SHOT_SECS` for screenshots; the log's memory line now has
+the battery and a line with CPU by thread (`c435956`). `--gtav_native_pass_gpu_times` halves the
+frame rate while it is on: proportions only. Battery limits a night on a 5 W charger: the game
+drains about 1% a minute while charging.
