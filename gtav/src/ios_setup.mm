@@ -414,6 +414,24 @@ NSMutableArray<NSURL*>* g_scoped;  // security-scoped picks, held for the proces
 // NSProcessInfo.thermalState for the memory log line (native/capture.cpp): 0 nominal .. 3 critical.
 extern "C" int gtav_ios_thermal_state() { return int(NSProcessInfo.processInfo.thermalState); }
 
+// Battery for the same line: percent (-1 until known), and through *charging whether it is on a
+// charger. The game draws more than a weak charger delivers (the phone ran flat during a long
+// test), and a nearly empty battery is a reason for low fps of its own. UIDevice belongs to the
+// main thread: each call asks it for a fresh reading and returns the last one.
+extern "C" int gtav_ios_battery(int* charging) {
+  static std::atomic<int> level{-1}, on_charger{0};
+  dispatch_async(dispatch_get_main_queue(), ^{
+    UIDevice* device = UIDevice.currentDevice;
+    if (!device.batteryMonitoringEnabled) device.batteryMonitoringEnabled = YES;
+    const float l = device.batteryLevel;
+    level.store(l < 0 ? -1 : int(l * 100 + 0.5f), std::memory_order_relaxed);
+    const UIDeviceBatteryState state = device.batteryState;
+    on_charger.store(state == UIDeviceBatteryStateCharging || state == UIDeviceBatteryStateFull, std::memory_order_relaxed);
+  });
+  if (charging) *charging = on_charger.load(std::memory_order_relaxed);
+  return level.load(std::memory_order_relaxed);
+}
+
 // BC (DXT) textures on this GPU (iOS 16.4+ reports it per device; MoltenVK passes it through as
 // textureCompressionBC): without it native/textures.cpp decodes them on the CPU.
 extern "C" int gtav_ios_supports_bc() {

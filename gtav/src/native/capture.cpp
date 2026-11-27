@@ -34,6 +34,7 @@
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #include <mach/mach.h>
+#include <pthread.h>
 #include <malloc/malloc.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -43,6 +44,7 @@
 extern "C" void* MTLCreateSystemDefaultDevice(void);
 #if TARGET_OS_IPHONE
 extern "C" int gtav_ios_thermal_state();  // ios_setup.mm
+extern "C" int gtav_ios_battery(int* charging);  // percent (-1: not known yet); ios_setup.mm
 #endif
 // Bytes the process has allocated on the (only) Metal device: MoltenVK's buffers and textures.
 static uint64_t MetalAllocatedBytes() {
@@ -663,6 +665,65 @@ void DrawsRecorded(uint32_t count) {
   }
 }
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// Where the CPU time went since the last call: the busiest threads, in % of one core (the phone
+// has two performance cores; the game's main and render threads, the recorder and the submitter
+// all want one).
+static void LogThreadCpu(uint64_t frame) {
+  static std::unordered_map<uint64_t, uint64_t> last;  // thread id -> CPU microseconds
+  static auto last_time = std::chrono::steady_clock::now();
+  static bool first = true;  // the first call only takes the readings (no interval to report yet)
+  thread_act_array_t threads = nullptr;
+  mach_msg_type_number_t count = 0;
+  if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
+  const auto now = std::chrono::steady_clock::now();
+  const double wall_us = std::max(1.0, std::chrono::duration<double, std::micro>(now - last_time).count());
+  last_time = now;
+  struct Row {
+    uint64_t us;
+    char name[40];
+  };
+  std::vector<Row> rows;
+  std::unordered_map<uint64_t, uint64_t> seen;
+  uint64_t total = 0;
+  for (mach_msg_type_number_t i = 0; i < count; i++) {
+    thread_basic_info_data_t basic{};
+    mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT;
+    thread_identifier_info_data_t id{};
+    mach_msg_type_number_t in = THREAD_IDENTIFIER_INFO_COUNT;
+    if (thread_info(threads[i], THREAD_BASIC_INFO, thread_info_t(&basic), &bn) == KERN_SUCCESS &&
+        thread_info(threads[i], THREAD_IDENTIFIER_INFO, thread_info_t(&id), &in) == KERN_SUCCESS) {
+      const uint64_t us = uint64_t(basic.user_time.seconds + basic.system_time.seconds) * 1000000ull +
+                          uint64_t(basic.user_time.microseconds + basic.system_time.microseconds);
+      seen[id.thread_id] = us;
+      auto was = last.find(id.thread_id);
+      const uint64_t used = was == last.end() ? us : us > was->second ? us - was->second : 0;
+      if (used) {
+        Row row{used, {}};
+        if (pthread_t p = pthread_from_mach_thread_np(threads[i])) pthread_getname_np(p, row.name, sizeof(row.name));
+        if (!row.name[0])
+          std::snprintf(row.name, sizeof(row.name), "thread %llx", static_cast<unsigned long long>(id.thread_id));
+        rows.push_back(row);
+        total += used;
+      }
+    }
+    mach_port_deallocate(mach_task_self(), threads[i]);
+  }
+  vm_deallocate(mach_task_self(), vm_address_t(threads), count * sizeof(thread_act_t));
+  last.swap(seen);
+  if (first) {
+    first = false;
+    return;
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.us > b.us; });
+  std::string list;
+  for (size_t i = 0; i < rows.size() && i < 14; i++)
+    list += fmt::format("{}{} {:.0f}", i ? ", " : "", rows[i].name, double(rows[i].us) / wall_us * 100.0);
+  REXLOG_INFO("[native] threads at frame {}: {} threads used {:.0f}% of one core since the last line: {}", frame, count,
+              double(total) / wall_us * 100.0, list);
+}
+#endif
+
 void FenceCopiesRecorded(uint64_t frame) {
   {
     std::lock_guard lock(g_copy_mutex);
@@ -688,14 +749,17 @@ void FenceCopiesRecorded(uint64_t frame) {
         task_events_info_data_t ev{};
         mach_msg_type_number_t en = TASK_EVENTS_INFO_COUNT;
         if (task_info(mach_task_self(), TASK_EVENTS_INFO, task_info_t(&ev), &en) != KERN_SUCCESS) ev = last_ev;
+        int charging = 0;
+        const int battery = gtav_ios_battery(&charging);
         REXLOG_INFO("[native] memory at frame {}: footprint {} MB, available {} MB, compressed {} MB; Metal {} MB, "
                     "malloc {} MB; thermal {}; resident {} MB (file {} MB); since the last line {} faults, {} "
-                    "page-ins",
+                    "page-ins; battery {}%{}",
                     frame, vm.phys_footprint >> 20, os_proc_available_memory() >> 20, vm.compressed >> 20,
                     MetalAllocatedBytes() >> 20, ms.size_in_use >> 20,
                     kThermal[std::clamp(gtav_ios_thermal_state(), 0, 3)], vm.resident_size >> 20, vm.external >> 20,
-                    ev.faults - last_ev.faults, ev.pageins - last_ev.pageins);
+                    ev.faults - last_ev.faults, ev.pageins - last_ev.pageins, battery, charging ? " (charging)" : "");
         last_ev = ev;
+        LogThreadCpu(frame);
 #else
         REXLOG_INFO("[native] memory at frame {}: footprint {} MB, compressed {} MB", frame, vm.phys_footprint >> 20,
                     vm.compressed >> 20);
