@@ -39,12 +39,15 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #if TARGET_OS_IPHONE
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <os/proc.h>
 #endif
 extern "C" void* MTLCreateSystemDefaultDevice(void);
 #if TARGET_OS_IPHONE
 extern "C" int gtav_ios_thermal_state();  // ios_setup.mm
 extern "C" int gtav_ios_battery(int* charging);  // percent (-1: not known yet); ios_setup.mm
+extern "C" void gtav_ios_watch_system(void (*cb)(int kind, int value));  // ios_setup.mm
 #endif
 // Bytes the process has allocated on the (only) Metal device: MoltenVK's buffers and textures.
 static uint64_t MetalAllocatedBytes() {
@@ -666,6 +669,104 @@ void DrawsRecorded(uint32_t count) {
 }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
+// Big allocations, with who made them (11-27): two long runs had CPU memory (malloc) jump by
+// 250-420 MB within a second, once followed by the end of the run (jetsam, no report), and nothing
+// the renderer counts moved. With --gtav_native_big_alloc_mb=N every allocation of N MB or more is
+// kept with its thread and call stack (the hook runs inside malloc: no allocation, no lock, no
+// logging there) and logged on the next frame; allocations of 1 MB or more are summed for the
+// watch line. Off by default.
+REXCVAR_DEFINE_INT32(gtav_native_big_alloc_mb, 0, "GTAV",
+                     "iPhone: log allocations of this many MB or more with their call stack (0: off)");
+namespace big_alloc {
+constexpr int kFrames = 16;
+constexpr uint32_t kRing = 64;
+struct Entry {
+  uint64_t size, tid, us;
+  int frames;
+  char name[16];
+  void* pcs[kFrames];
+  std::atomic<uint32_t> ready;  // the entry's number + 1 once written
+};
+Entry g_ring[kRing];
+std::atomic<uint32_t> g_next{0};
+uint32_t g_shown = 0;
+std::atomic<uint64_t> g_threshold{~0ull};
+std::atomic<uint64_t> g_mb_bytes{0}, g_mb_count{0};  // allocations of 1 MB or more since the last read
+using Logger = void (*)(uint32_t type, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t result, uint32_t skip);
+}  // namespace big_alloc
+extern "C" big_alloc::Logger malloc_logger;  // libmalloc; what the allocation tools hook
+
+namespace big_alloc {
+void Hook(uint32_t type, uintptr_t, uintptr_t a2, uintptr_t a3, uintptr_t result, uint32_t) {
+  if (!(type & 2) || !result) return;              // MALLOC_LOG_TYPE_ALLOCATE
+  const uint64_t size = (type & 4) ? a3 : a2;      // realloc (ALLOCATE | DEALLOCATE): a3 = new size
+  if (size < (1u << 20)) return;
+  g_mb_bytes.fetch_add(size, std::memory_order_relaxed);
+  g_mb_count.fetch_add(1, std::memory_order_relaxed);
+  if (size < g_threshold.load(std::memory_order_relaxed)) return;
+  const uint32_t n = g_next.fetch_add(1, std::memory_order_relaxed);
+  Entry& e = g_ring[n % kRing];
+  e.ready.store(0, std::memory_order_relaxed);
+  e.size = size;
+  pthread_threadid_np(nullptr, &e.tid);
+  e.name[0] = 0;
+  pthread_getname_np(pthread_self(), e.name, sizeof(e.name));
+  e.us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+  e.frames = backtrace(e.pcs, kFrames);
+  e.ready.store(n + 1, std::memory_order_release);
+}
+
+// Frame thread: installs the hook once (and checks that it sees allocations), then logs what it
+// caught since the last call.
+void Poll() {
+  static bool installed = false;
+  const int mb = REXCVAR_GET(gtav_native_big_alloc_mb);
+  if (!installed) {
+    if (mb <= 0) return;
+    installed = true;
+    g_threshold.store(uint64_t(mb) << 20, std::memory_order_relaxed);
+    malloc_logger = Hook;
+    // The test allocation goes through a volatile pointer and is touched: the compiler removes an
+    // unused malloc/free pair (it did in the first build, and the line said the hook saw nothing).
+    static void* (*volatile do_malloc)(size_t) = std::malloc;
+    const uint32_t before = g_next.load(std::memory_order_acquire);
+    void* probe = do_malloc((size_t(mb) << 20) + 4096);
+    if (probe) static_cast<volatile char*>(probe)[0] = 1;
+    std::free(probe);
+    const bool works = g_next.load(std::memory_order_acquire) != before;
+    REXLOG_INFO("[native] big allocations: logging those of {} MB or more ({})", mb,
+                works ? "the hook saw the test allocation" : "the hook saw no test allocation");
+    g_shown = g_next.load(std::memory_order_acquire);  // not the test allocation
+    return;
+  }
+  const uint32_t next = g_next.load(std::memory_order_acquire);
+  if (next - g_shown > kRing) g_shown = next - kRing;
+  for (int logged = 0; g_shown != next && logged < 8; g_shown++, logged++) {
+    Entry& e = g_ring[g_shown % kRing];
+    if (e.ready.load(std::memory_order_acquire) != g_shown + 1) break;  // still being written
+    std::string stack;
+    for (int i = 2; i < e.frames; i++) {  // 0, 1: the hook and libmalloc
+      Dl_info info{};
+      if (dladdr(e.pcs[i], &info) && info.dli_fbase) {
+        const char* file = info.dli_fname ? std::strrchr(info.dli_fname, '/') : nullptr;
+        stack += fmt::format(" {}+{:X}", file ? file + 1 : "?",
+                             uintptr_t(e.pcs[i]) - uintptr_t(info.dli_fbase));
+        if (info.dli_sname) stack += fmt::format("({})", info.dli_sname);
+      } else {
+        stack += fmt::format(" {:X}", uintptr_t(e.pcs[i]));
+      }
+    }
+    const uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    REXLOG_INFO("[native] big allocation: {} MB on {} ({}), {} ms ago:{}", e.size >> 20,
+                e.name[0] ? e.name : "a thread", e.tid, (now_us - e.us) / 1000, stack);
+  }
+}
+}  // namespace big_alloc
+
 // Where the CPU time went since the last call: the busiest threads, in % of one core (the phone
 // has two performance cores; the game's main and render threads, the recorder and the submitter
 // all want one).
@@ -731,6 +832,44 @@ void FenceCopiesRecorded(uint64_t frame) {
     g_copy_floor = frame + 1;
     DrainIncomingCopies();
     while (!g_pending_copies.empty() && g_pending_copies.front().frame <= frame) g_pending_copies.pop_front();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // What the system reports, as it happens (thermal state changes, memory warnings), and while
+    // the phone is hot or short of memory a short line every 30 frames: three long runs ended
+    // with no report (11-27) and the memory line every 120 frames left the last seconds unseen.
+    static const char* kThermalName[] = {"nominal", "fair", "serious", "critical"};
+    big_alloc::Poll();
+    gtav_ios_watch_system([](int kind, int value) {
+      if (kind == 0)
+        REXLOG_INFO("[native] iOS: thermal state now {} (available {} MB)", kThermalName[std::clamp(value, 0, 3)],
+                    os_proc_available_memory() >> 20);
+      else
+        REXLOG_INFO("[native] iOS: memory warning (available {} MB)", os_proc_available_memory() >> 20);
+    });
+    // Once a second (by the clock: a slow GPU made 30 frames 7 s on 11-27, and the end came within
+    // 9 s of a 420 MB jump that the line did not split up).
+    static auto last_watch = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now();
+        now - last_watch >= std::chrono::seconds(1) &&
+        (gtav_ios_thermal_state() >= 2 || os_proc_available_memory() < (uint64_t(700) << 20))) {
+      last_watch = now;
+      task_vm_info_data_t vm{};
+      mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+      if (task_info(mach_task_self(), TASK_VM_INFO, task_info_t(&vm), &n) == KERN_SUCCESS) {
+        malloc_statistics_t ms{};
+        malloc_zone_statistics(nullptr, &ms);
+        const uint64_t big_bytes = big_alloc::g_mb_bytes.exchange(0, std::memory_order_relaxed);
+        const uint64_t big_count = big_alloc::g_mb_count.exchange(0, std::memory_order_relaxed);
+        REXLOG_INFO("[native] watch at frame {}: footprint {} MB, available {} MB, Metal {} MB, malloc {} MB, "
+                    "compressed {} MB, resident {} MB (file {} MB), thermal {}{}",
+                    frame, vm.phys_footprint >> 20, os_proc_available_memory() >> 20, MetalAllocatedBytes() >> 20,
+                    ms.size_in_use >> 20, vm.compressed >> 20, vm.resident_size >> 20, vm.external >> 20,
+                    kThermalName[std::clamp(gtav_ios_thermal_state(), 0, 3)],
+                    malloc_logger ? fmt::format("; {} allocations of 1 MB+ ({} MB) since the last line", big_count,
+                                                big_bytes >> 20)
+                                  : std::string());
+      }
+    }
+#endif
 #if defined(__APPLE__)
     if (frame % 120 == 0) {
       // phys_footprint is what jetsam counts; os_proc_available_memory is the headroom left (iOS).

@@ -414,6 +414,20 @@ NSMutableArray<NSURL*>* g_scoped;  // security-scoped picks, held for the proces
 // NSProcessInfo.thermalState for the memory log line (native/capture.cpp): 0 nominal .. 3 critical.
 extern "C" int gtav_ios_thermal_state() { return int(NSProcessInfo.processInfo.thermalState); }
 
+// iOS's own signals, for the log (native/capture.cpp): cb(0, state) when the thermal state changes
+// (0 nominal .. 3 critical), cb(1, 0) on a memory warning. 11-27: three long runs on the 13 mini
+// ended with no crash or jetsam report after 11-20 minutes, hot, with 650-690 MB of headroom in
+// the last memory line; the log did not say what the system saw in the seconds before.
+extern "C" void gtav_ios_watch_system(void (*cb)(int kind, int value)) {
+  static std::atomic<bool> once{false};
+  if (once.exchange(true)) return;
+  NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
+  [center addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil
+                  usingBlock:^(NSNotification*) { cb(0, int(NSProcessInfo.processInfo.thermalState)); }];
+  [center addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil
+                  usingBlock:^(NSNotification*) { cb(1, 0); }];
+}
+
 // Battery for the same line: percent (-1 until known), and through *charging whether it is on a
 // charger. The game draws more than a weak charger delivers (the phone ran flat during a long
 // test), and a nearly empty battery is a reason for low fps of its own. UIDevice belongs to the
