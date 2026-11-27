@@ -2458,7 +2458,7 @@ index ef5bdf4..7a6cf2e 100644
 +
  }  // namespace rex
 diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
-index b52bf39..833df74 100644
+index b52bf39..27dcb9e 100644
 --- a/src/core/memory_posix.cpp
 +++ b/src/core/memory_posix.cpp
 @@ -19,9 +19,13 @@
@@ -2475,7 +2475,32 @@ index b52bf39..833df74 100644
  #include <mach/vm_region.h>
  #endif  // REX_PLATFORM_MAC
  
-@@ -51,10 +55,7 @@
+@@ -45,16 +49,32 @@
+ #define rex_ftruncate64 ftruncate64
+ #endif
+ 
++#if REX_PLATFORM_IOS
++#include <mach/memory_entry.h>
++#include <mach/memory_object_types.h>
++#include <mach/vm_map.h>
++#include <mach/vm_statistics.h>
++#include <os/proc.h>
++
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_STRING(ios_guest_memory, "file", "Memory",
++                      "iPhone guest memory backing. file: a sparse file in tmp (its pages do not "
++                      "count toward the app's memory limit, but iOS writes them to flash and reads "
++                      "them back). anon: anonymous memory (stays in RAM, counts toward the limit). "
++                      "phys: anonymous for the physical and image regions only. auto: anon when the "
++                      "app starts with 3,000 MB or more to its limit (not a 4 GB phone)")
++    .allowed({"file", "anon", "phys", "auto"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif
++
+ #if REX_PLATFORM_ANDROID
+ #include <string.h>
+ 
  #include <dlfcn.h>
  #include <sys/ioctl.h>
  
@@ -2487,7 +2512,7 @@ index b52bf39..833df74 100644
  #endif
  
  namespace rex {
-@@ -84,32 +85,6 @@ static std::string MakeShmName(const std::filesystem::path& path) {
+@@ -84,32 +104,6 @@ static std::string MakeShmName(const std::filesystem::path& path) {
    return name;
  }
  
@@ -2520,7 +2545,7 @@ index b52bf39..833df74 100644
  
  size_t page_size() {
    return getpagesize();
-@@ -278,9 +253,11 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+@@ -278,9 +272,11 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
  
    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
  #if REX_PLATFORM_MAC
@@ -2532,7 +2557,7 @@ index b52bf39..833df74 100644
    if (base_address) {
      flags |= MAP_FIXED;
    }
-@@ -381,9 +358,20 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+@@ -381,9 +377,20 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
    mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
    mach_port_t object_name;
  
@@ -2553,7 +2578,84 @@ index b52bf39..833df74 100644
    if (kr != KERN_SUCCESS) {
      return false;
    }
-@@ -432,28 +420,39 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+@@ -429,31 +436,117 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+ #endif
+ }
+ 
++#if REX_PLATFORM_IOS
++namespace {
++// The guest mapping's layout (system/xmemory.cpp, map_info): offsets [0, 2 GB) back the two
++// virtual heaps (one view each), [2 GB, 2 GB + 256 MB) the image region (two views) and
++// [4 GB, 4 GB + 512 MB + one granule) the physical region (five views). The two aliased regions
++// need a shared object; the heaps can be plain private memory.
++constexpr size_t kIosImageOffset = 0x80000000ull;
++constexpr size_t kIosImageSize = 0x10000000ull;
++constexpr size_t kIosPhysicalOffset = 0x100000000ull;
++struct IosGuestMemory {
++  int fd = -1;   // the guest mapping's backing file, once created
++  int mode = 0;  // 0 file, 1 phys (image + physical anonymous), 2 anon (the heaps too)
++  mach_port_t image = MACH_PORT_NULL;
++  mach_port_t physical = MACH_PORT_NULL;
++  size_t physical_size = 0;
++} g_ios_guest;
++
++mach_port_t IosNamedEntry(size_t size, const char* what) {
++  // Ledger-tagged first: the object's pages are then charged to the app once, however many views
++  // map them (a plain shared object is charged per mapping that touches a page).
++  for (int tagged = 1; tagged >= 0; --tagged) {
++    memory_object_size_t entry_size = size;
++    mach_port_t entry = MACH_PORT_NULL;
++    kern_return_t kr = mach_make_memory_entry_64(
++        mach_task_self(), &entry_size, 0,
++        MAP_MEM_NAMED_CREATE | (tagged ? MAP_MEM_LEDGER_TAGGED : 0) | VM_PROT_READ | VM_PROT_WRITE,
++        &entry, MACH_PORT_NULL);
++    if (kr == KERN_SUCCESS && entry != MACH_PORT_NULL && entry_size >= size) {
++      kern_return_t own = tagged ? mach_memory_entry_ownership(entry, mach_task_self(),
++                                                               VM_LEDGER_TAG_DEFAULT, 0)
++                                 : KERN_SUCCESS;
++      REXSYS_INFO("guest memory: {} entry of {} MB created ({}, ownership call {})", what,
++                  size >> 20, tagged ? "ledger-tagged" : "untagged", own);
++      return entry;
++    }
++    if (entry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), entry);
++    REXSYS_WARN("guest memory: {} entry of {} MB failed ({}): kr {}", what, size >> 20,
++                tagged ? "ledger-tagged" : "untagged", kr);
++  }
++  return MACH_PORT_NULL;
++}
++
++// Called once the backing file exists. Only the guest address space itself (4 GB + the physical
++// view) takes the anonymous option; any failure leaves the file in charge.
++void IosChooseGuestMemory(int fd, size_t length) {
++  if (g_ios_guest.fd >= 0 || length < kIosPhysicalOffset + 0x20000000ull) return;
++  std::string want = REXCVAR_GET(ios_guest_memory);
++  const size_t headroom_mb = static_cast<size_t>(os_proc_available_memory()) >> 20;
++  const std::string asked = want;
++  // iPhone 13 mini (4 GB, 2,336 MB of headroom at start), 11-27: anon ended the page-ins of the
++  // file (114-624 a second walking around -> 2-16) but cost 280 MB of footprint (1,993 MB after
++  // 3.5 minutes, 354 MB left) and gave no frame rate. So auto leaves 4 GB phones on the file; the
++  // 3,000 MB line for larger ones is not measured.
++  if (want == "auto") want = headroom_mb >= 3000 ? "anon" : "file";
++  int mode = want == "anon" ? 2 : want == "phys" ? 1 : 0;
++  if (mode) {
++    g_ios_guest.physical_size = length - kIosPhysicalOffset;
++    g_ios_guest.image = IosNamedEntry(kIosImageSize, "image");
++    g_ios_guest.physical = IosNamedEntry(g_ios_guest.physical_size, "physical");
++    if (g_ios_guest.image == MACH_PORT_NULL || g_ios_guest.physical == MACH_PORT_NULL) {
++      if (g_ios_guest.image != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), g_ios_guest.image);
++      if (g_ios_guest.physical != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), g_ios_guest.physical);
++      g_ios_guest.image = g_ios_guest.physical = MACH_PORT_NULL;
++      mode = 0;
++    }
++  }
++  g_ios_guest.mode = mode;
++  g_ios_guest.fd = fd;
++  REXSYS_INFO("guest memory: {} (--ios_guest_memory={}; {} MB of headroom at start)",
++              mode == 2 ? "anon" : mode == 1 ? "phys" : "file", asked, headroom_mb);
++}
++}  // namespace
++#endif  // REX_PLATFORM_IOS
++
  FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                            PageAccess access, bool commit) {
  #if REX_PLATFORM_ANDROID
@@ -2575,18 +2677,12 @@ index b52bf39..833df74 100644
 +  (void)commit;
 +  int fd = memfd_create(path.filename().c_str(), MFD_CLOEXEC);
 +  if (fd < 0) {
-     return kFileMappingHandleInvalid;
-   }
--  char ashmem_name[ASHMEM_NAME_LEN];
--  strlcpy(ashmem_name, path.c_str(), rex::countof(ashmem_name));
--  if (ioctl(ashmem_fd, ASHMEM_SET_NAME, ashmem_name) < 0 ||
--      ioctl(ashmem_fd, ASHMEM_SET_SIZE, length) < 0) {
--    close(ashmem_fd);
++    return kFileMappingHandleInvalid;
++  }
 +  if (ftruncate64(fd, static_cast<off64_t>(length)) != 0) {
 +    close(fd);
-     return kFileMappingHandleInvalid;
-   }
--  return static_cast<FileMappingHandle>(ashmem_fd);
++    return kFileMappingHandleInvalid;
++  }
 +  return static_cast<FileMappingHandle>(fd);
 +#elif REX_PLATFORM_IOS
 +  // The iOS sandbox denies shm_open: back the guest memory with a sparse file in the app's tmp
@@ -2599,19 +2695,26 @@ index b52bf39..833df74 100644
 +  int fd = open(backing.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
 +  if (fd < 0) {
 +    REXSYS_ERROR("guest memory backing file {} failed: {}", backing.string(), strerror(errno));
-+    return kFileMappingHandleInvalid;
-+  }
+     return kFileMappingHandleInvalid;
+   }
+-  char ashmem_name[ASHMEM_NAME_LEN];
+-  strlcpy(ashmem_name, path.c_str(), rex::countof(ashmem_name));
+-  if (ioctl(ashmem_fd, ASHMEM_SET_NAME, ashmem_name) < 0 ||
+-      ioctl(ashmem_fd, ASHMEM_SET_SIZE, length) < 0) {
+-    close(ashmem_fd);
 +  unlink(backing.c_str());
 +  if (ftruncate(fd, static_cast<off_t>(length)) != 0) {
 +    REXSYS_ERROR("guest memory backing file truncate to 0x{:X} failed: {}", length, strerror(errno));
 +    close(fd);
-+    return kFileMappingHandleInvalid;
-+  }
+     return kFileMappingHandleInvalid;
+   }
+-  return static_cast<FileMappingHandle>(ashmem_fd);
++  IosChooseGuestMemory(fd, length);
 +  return static_cast<FileMappingHandle>(fd);
  #else
    int oflag;
    switch (access) {
-@@ -483,13 +482,17 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+@@ -483,13 +576,24 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
      shm_unlink(full_path.c_str());
      return kFileMappingHandleInvalid;
    }
@@ -2624,12 +2727,63 @@ index b52bf39..833df74 100644
  }
  
  void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
++#if REX_PLATFORM_IOS
++  if (static_cast<int>(handle) == g_ios_guest.fd) {
++    if (g_ios_guest.image != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), g_ios_guest.image);
++    if (g_ios_guest.physical != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), g_ios_guest.physical);
++    g_ios_guest = {};
++  }
++#endif
    close(static_cast<int>(handle));
 -#if !REX_PLATFORM_ANDROID
 +#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_IOS
    auto full_path = MakeShmName(path);
    shm_unlink(full_path.c_str());
  #endif
+@@ -503,6 +607,43 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+     return nullptr;
+   }
+ 
++#if REX_PLATFORM_IOS
++  // Anonymous guest memory (--ios_guest_memory): the aliased regions come from their named
++  // entries, the heaps from private memory; whatever is left stays on the file.
++  if (g_ios_guest.mode && static_cast<int>(handle) == g_ios_guest.fd && base_address) {
++    mach_port_t entry = MACH_PORT_NULL;
++    size_t entry_offset = 0;
++    if (file_offset >= kIosPhysicalOffset &&
++        file_offset + length <= kIosPhysicalOffset + g_ios_guest.physical_size) {
++      entry = g_ios_guest.physical;
++      entry_offset = file_offset - kIosPhysicalOffset;
++    } else if (file_offset >= kIosImageOffset &&
++               file_offset + length <= kIosImageOffset + kIosImageSize) {
++      entry = g_ios_guest.image;
++      entry_offset = file_offset - kIosImageOffset;
++    }
++    if (entry != MACH_PORT_NULL) {
++      vm_address_t address = reinterpret_cast<vm_address_t>(base_address);
++      const vm_prot_t prot = static_cast<vm_prot_t>(ToPosixProtectFlags(access)) &
++                             (VM_PROT_READ | VM_PROT_WRITE);
++      kern_return_t kr = vm_map(mach_task_self(), &address, length, 0,
++                                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, entry_offset, FALSE,
++                                prot, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
++      if (kr != KERN_SUCCESS || address != reinterpret_cast<vm_address_t>(base_address)) {
++        REXSYS_ERROR("guest memory: vm_map of 0x{:X} bytes at offset 0x{:X} failed: kr {}", length,
++                     file_offset, kr);
++        return nullptr;
++      }
++      return base_address;
++    }
++    if (g_ios_guest.mode == 2 && file_offset + length <= kIosImageOffset) {
++      void* heap = mmap(base_address, length, ToPosixProtectFlags(access),
++                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++      return heap == MAP_FAILED ? nullptr : heap;
++    }
++  }
++#endif
++
+   int flags = MAP_SHARED;
+ 
+   // For file views, we need MAP_FIXED to replace existing reservations.
 diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
 index 5e0a932..cd75b74 100644
 --- a/src/core/seh_posix.cpp
@@ -4831,7 +4985,7 @@ index c24fbd1..0663781 100644
    return 1;
  }
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 76cc877..34c19f6 100644
+index 76cc877..8e12ddb 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -13,12 +13,18 @@
@@ -4854,7 +5008,23 @@ index 76cc877..34c19f6 100644
  #include <rex/assert.h>
  #include <rex/chrono/clock.h>
  #include <rex/cvar.h>
-@@ -363,6 +369,27 @@ int Memory::MapViews(uint8_t* mapping_base) {
+@@ -337,8 +343,15 @@ int Memory::MapViewsMac() {
+                                            map_info[n].virtual_address_start + 1);
+     size_t file_offset = static_cast<size_t>(map_info[n].target_address & granularity_mask);
+     void* target_address = mapping_base + map_info[n].virtual_address_start;
++#if REX_PLATFORM_IOS
++    // Through MapFileView: the iPhone chooses the backing of each region there (--ios_guest_memory).
++    void* result = rex::memory::MapFileView(mapping_, target_address, view_size,
++                                            rex::memory::PageAccess::kReadWrite, file_offset);
++    if (!result) result = MAP_FAILED;
++#else
+     void* result = mmap(target_address, view_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                         mapping_, file_offset);
++#endif
+     if (result == MAP_FAILED || result != target_address) {
+       int err = errno;
+       REXSYS_ERROR(
+@@ -363,6 +376,27 @@ int Memory::MapViews(uint8_t* mapping_base) {
    // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
    // side if system allocation granularity is bigger than 4 KB.
    uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
@@ -4882,7 +5052,7 @@ index 76cc877..34c19f6 100644
    for (size_t n = 0; n < rex::countof(map_info); n++) {
      views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
          mapping_, mapping_base + map_info[n].virtual_address_start,
-@@ -547,6 +574,24 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+@@ -547,6 +581,24 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
          is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
          rex::thread::current_thread_id());
