@@ -105,6 +105,19 @@ REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, GTAV_FENCE_WAIT_DEFAULT, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_fence_wait_ms, GTAV_FENCE_WAIT_MS_DEFAULT, "GTAV",
                      "Longest wait of the command processor at a GPU fence for the renderer (then it copies, "
                      "or gives up for the frame being recorded; Mac: stalls past 100 ms left one-frame slabs)");
+// The copies are made for the frame the game is still building, when it waits on a fence before
+// its Swap; with a slow renderer that came in bursts of 160-310 MB of vertex data per 300 frames,
+// and the iPhone 13 mini's CPU memory jumped by 250-420 MB within a second at those bursts
+// (11-27: memory warnings at 464 MB left, and one run ended there with no report). Past this
+// many MB held in copies, a draw is not copied: the renderer reads its guest memory as Linux
+// always does (a one-frame wrong mesh at worst, against the app being closed).
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_FENCE_COPY_BUDGET_MB 96
+#else
+#define GTAV_FENCE_COPY_BUDGET_MB 0
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_fence_copy_budget_mb, GTAV_FENCE_COPY_BUDGET_MB, "GTAV",
+                     "Most MB of draw data held in fence copies at once; past it draws are not copied (0: no limit)");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
                     "Experiment, with --gtav_native_fence_wait: wait only until the draw before the fence is "
                     "recorded, not its whole frame (the command processor then reaches the fences of the frame "
@@ -511,7 +524,7 @@ static std::atomic<uint32_t> g_fence_address{0};  // guest physical, where the G
 static constexpr uint32_t kDevFence = 11036;      // next fence value (InsertFence 8380E440)
 static constexpr uint32_t kDevFenceDone = 11024;  // -> where the GPU writes the completed fence
 static struct {
-  uint64_t copies = 0, bytes = 0, waits = 0, wait_timeouts = 0;
+  uint64_t copies = 0, bytes = 0, waits = 0, wait_timeouts = 0, over_budget = 0;
   double wait_ms = 0;
 } g_copy_stats;
 
@@ -599,6 +612,15 @@ static void FenceReached(uint32_t value) {
       continue;
     }
   copy:
+    if (const int budget_mb = REXCVAR_GET(gtav_native_fence_copy_budget_mb); budget_mb > 0) {
+      size_t held = 0;  // a few frames at most
+      for (const auto& [frame, arena] : g_fence_arenas) held += arena.size();
+      if (held >= (size_t(budget_mb) << 20)) {
+        g_copy_stats.over_budget++;
+        g_pending_copies.pop_front();
+        continue;
+      }
+    }
     {
       FenceCopy c;
       c.d.indexed = p.indexed, c.d.index32 = p.index32, c.d.base_vertex = p.base_vertex;
@@ -606,7 +628,7 @@ static void FenceReached(uint32_t value) {
       std::copy(std::begin(p.streams), std::end(p.streams), c.d.streams);
       auto found = g_fence_arenas.find(p.frame);
       if (found == g_fence_arenas.end()) {
-        found = g_fence_arenas.emplace(p.frame, ByteArena{}).first;
+        found = g_fence_arenas.emplace(p.frame, ByteArena{nullptr}).first;
         if (!g_spare_fence_arenas.empty()) {
           found->second = std::move(g_spare_fence_arenas.back());
           g_spare_fence_arenas.pop_back();
@@ -642,7 +664,9 @@ void ApplyFenceCopies(FramePacket& f) {
        it = g_fence_arenas.erase(it)) {
     if (it->first == f.index) std::swap(f.fence_arena, it->second);
     it->second.clear();
-    if (g_spare_fence_arenas.size() < 4) g_spare_fence_arenas.push_back(std::move(it->second));
+    // A burst's big arena is let go (the next burst grows a new one) rather than kept for good.
+    if (g_spare_fence_arenas.size() < 4 && it->second.capacity() <= (size_t(32) << 20))
+      g_spare_fence_arenas.push_back(std::move(it->second));
   }
   constexpr uint32_t kFenceBit = FramePacket::kFenceBit;
   for (auto it = g_fence_copies.begin(); it != g_fence_copies.end() && it->first.first <= f.index;
@@ -908,10 +932,11 @@ void FenceCopiesRecorded(uint64_t frame) {
 #endif
     if (frame % 300 == 0) {
       auto& st = g_copy_stats;
-      REXLOG_INFO("[native] fence copies per 300 frames: {} draws ({} KB), GPU waited for the renderer {} times "
-                  "({:.1f} ms, {} timeouts), {} queued; packet arenas grew {} times ({} MB moved)",
-                  st.copies, st.bytes / 1024, st.waits, st.wait_ms, st.wait_timeouts, g_pending_copies.size(),
-                  g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20);
+      REXLOG_INFO("[native] fence copies per 300 frames: {} draws ({} KB, {} more not copied: over the budget), "
+                  "GPU waited for the renderer {} times ({:.1f} ms, {} timeouts), {} queued; packet arenas grew {} "
+                  "times ({} MB moved)",
+                  st.copies, st.bytes / 1024, st.over_budget, st.waits, st.wait_ms, st.wait_timeouts,
+                  g_pending_copies.size(), g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20);
       st = {};
     }
   }

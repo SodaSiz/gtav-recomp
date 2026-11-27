@@ -161,20 +161,29 @@ inline std::atomic<size_t> g_arena_peak{0};
 
 class ByteArena {
  public:
+  ByteArena() = default;
+  // peak null: the arena starts at 1 MB and does not follow or raise g_arena_peak. The arenas of
+  // fence copies (capture.cpp) are made so (11-27, iPhone): they shared the packets' peak, so after
+  // one burst of copies at start-up every new packet and fence arena began at 64 MB.
+  explicit ByteArena(std::atomic<size_t>* peak) : peak_(peak) {}
   uint8_t* data() { return buf_.get(); }
   const uint8_t* data() const { return buf_.get(); }
   size_t size() const { return size_; }
+  size_t capacity() const { return cap_; }
   void clear() { size_ = 0; }
   void Shrink(size_t n) { size_ -= std::min(n, size_); }
   uint8_t* Grow(size_t n) {
     if (size_ + n > cap_) {
-      size_t cap = std::max(size_ + n, cap_ ? cap_ * 2 : std::max(size_t(4) << 20, g_arena_peak.load()));
+      size_t cap = std::max(size_ + n, cap_         ? cap_ * 2
+                                       : peak_ ? std::max(size_t(4) << 20, peak_->load())
+                                               : size_t(1) << 20);
       auto buf = std::make_unique_for_overwrite<uint8_t[]>(cap);
       if (size_) std::memcpy(buf.get(), buf_.get(), size_);
       g_arena_grows++, g_arena_grow_bytes += size_;
       buf_ = std::move(buf);
       cap_ = cap;
-      for (size_t peak = g_arena_peak.load(); cap > peak && !g_arena_peak.compare_exchange_weak(peak, cap);) {}
+      if (peak_)
+        for (size_t peak = peak_->load(); cap > peak && !peak_->compare_exchange_weak(peak, cap);) {}
     }
     uint8_t* p = buf_.get() + size_;
     size_ += n;
@@ -184,6 +193,7 @@ class ByteArena {
  private:
   std::unique_ptr<uint8_t[]> buf_;
   size_t size_ = 0, cap_ = 0;
+  std::atomic<size_t>* peak_ = &g_arena_peak;
 };
 
 struct FramePacket {
@@ -196,7 +206,7 @@ struct FramePacket {
   ByteArena arena;
   // Draw data the command processor copied at GPU fences (capture.cpp ApplyFenceCopies): handed
   // over whole, addressed with kFenceBit set in the offset.
-  ByteArena fence_arena;
+  ByteArena fence_arena{nullptr};
   static constexpr uint32_t kFenceBit = 0x80000000u;
   uint32_t front_buffer = 0;  // guest texture object passed to Swap
 
