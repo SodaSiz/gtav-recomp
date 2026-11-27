@@ -10,6 +10,8 @@
 
 #include "ios_setup.h"
 
+#import <Metal/Metal.h>
+
 #include <array>
 #include <atomic>
 #include <memory>
@@ -411,6 +413,15 @@ NSMutableArray<NSURL*>* g_scoped;  // security-scoped picks, held for the proces
 
 // NSProcessInfo.thermalState for the memory log line (native/capture.cpp): 0 nominal .. 3 critical.
 extern "C" int gtav_ios_thermal_state() { return int(NSProcessInfo.processInfo.thermalState); }
+
+// BC (DXT) textures on this GPU (iOS 16.4+ reports it per device; MoltenVK passes it through as
+// textureCompressionBC): without it native/textures.cpp decodes them on the CPU.
+extern "C" int gtav_ios_supports_bc() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (!device) return 0;
+  if (@available(iOS 16.4, *)) return device.supportsBCTextureCompression ? 1 : 0;
+  return 0;
+}
 
 namespace gtav::ios_setup {
 

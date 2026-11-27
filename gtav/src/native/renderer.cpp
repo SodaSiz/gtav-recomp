@@ -1669,9 +1669,19 @@ class Renderer {
 
   // GTAV_NATIVE_SHOT_DIR (+ GTAV_SHOT_SECS, default 10, or GTAV_SHOT_FRAMES): periodic PPM captures of the native
   // front buffer, comparable with the emulated renderer's GTAV_SHOT_DIR captures.
+  // A relative GTAV_NATIVE_SHOT_DIR is under logs/ (on a phone the app's folder is unknown to the
+  // launch command: devicectl -e '{"GTAV_NATIVE_SHOT_DIR":"shots"}').
   std::string ShotDir() {
     const char* dir = std::getenv("GTAV_NATIVE_SHOT_DIR");
-    return dir && *dir ? dir : LogPath("shots");
+    if (!dir || !*dir) return LogPath("shots");
+    if (std::filesystem::path(dir).is_absolute()) return dir;
+    static const std::string under_logs = [&] {
+      std::string p = LogPath(dir);
+      std::error_code ec;
+      std::filesystem::create_directories(p, ec);
+      return p;
+    }();
+    return under_logs;
   }
 
   bool WantShot(uint64_t index) {

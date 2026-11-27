@@ -681,11 +681,21 @@ void FenceCopiesRecorded(uint64_t frame) {
         malloc_zone_statistics(nullptr, &ms);
         // Thermal state (NSProcessInfo: 0 nominal .. 3 critical): a hot phone throttles the GPU 2x+.
         static const char* kThermal[] = {"nominal", "fair", "serious", "critical"};
+        // Faults and page-ins since the last line: the guest memory is a file-backed shared mapping
+        // here (the sandbox denies shm_open), so pages the system evicted come back from flash.
+        // "file" is resident file-backed memory (the guest memory among it).
+        static task_events_info_data_t last_ev{};
+        task_events_info_data_t ev{};
+        mach_msg_type_number_t en = TASK_EVENTS_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_EVENTS_INFO, task_info_t(&ev), &en) != KERN_SUCCESS) ev = last_ev;
         REXLOG_INFO("[native] memory at frame {}: footprint {} MB, available {} MB, compressed {} MB; Metal {} MB, "
-                    "malloc {} MB; thermal {}",
+                    "malloc {} MB; thermal {}; resident {} MB (file {} MB); since the last line {} faults, {} "
+                    "page-ins",
                     frame, vm.phys_footprint >> 20, os_proc_available_memory() >> 20, vm.compressed >> 20,
                     MetalAllocatedBytes() >> 20, ms.size_in_use >> 20,
-                    kThermal[std::clamp(gtav_ios_thermal_state(), 0, 3)]);
+                    kThermal[std::clamp(gtav_ios_thermal_state(), 0, 3)], vm.resident_size >> 20, vm.external >> 20,
+                    ev.faults - last_ev.faults, ev.pageins - last_ev.pageins);
+        last_ev = ev;
 #else
         REXLOG_INFO("[native] memory at frame {}: footprint {} MB, compressed {} MB", frame, vm.phys_footprint >> 20,
                     vm.compressed >> 20);
