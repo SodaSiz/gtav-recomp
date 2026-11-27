@@ -10,6 +10,8 @@
 
 #include "ios_setup.h"
 
+#import <Metal/Metal.h>
+
 #include <array>
 #include <atomic>
 #include <memory>
@@ -411,6 +413,69 @@ NSMutableArray<NSURL*>* g_scoped;  // security-scoped picks, held for the proces
 
 // NSProcessInfo.thermalState for the memory log line (native/capture.cpp): 0 nominal .. 3 critical.
 extern "C" int gtav_ios_thermal_state() { return int(NSProcessInfo.processInfo.thermalState); }
+
+// iOS's own signals, for the log (native/capture.cpp): cb(0, state) when the thermal state changes
+// (0 nominal .. 3 critical), cb(1, 0) on a memory warning. 11-27: three long runs on the 13 mini
+// ended with no crash or jetsam report after 11-20 minutes, hot, with 650-690 MB of headroom in
+// the last memory line; the log did not say what the system saw in the seconds before.
+extern "C" void gtav_ios_watch_system(void (*cb)(int kind, int value)) {
+  static std::atomic<bool> once{false};
+  if (once.exchange(true)) return;
+  NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
+  [center addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil
+                  usingBlock:^(NSNotification*) { cb(0, int(NSProcessInfo.processInfo.thermalState)); }];
+  [center addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil
+                  usingBlock:^(NSNotification*) { cb(1, 0); }];
+}
+
+// Battery for the same line: percent (-1 until known), and through *charging whether it is on a
+// charger. The game draws more than a weak charger delivers (the phone ran flat during a long
+// test), and a nearly empty battery is a reason for low fps of its own. UIDevice belongs to the
+// main thread: each call asks it for a fresh reading and returns the last one.
+extern "C" int gtav_ios_battery(int* charging) {
+  static std::atomic<int> level{-1}, on_charger{0};
+  dispatch_async(dispatch_get_main_queue(), ^{
+    UIDevice* device = UIDevice.currentDevice;
+    if (!device.batteryMonitoringEnabled) device.batteryMonitoringEnabled = YES;
+    const float l = device.batteryLevel;
+    level.store(l < 0 ? -1 : int(l * 100 + 0.5f), std::memory_order_relaxed);
+    const UIDeviceBatteryState state = device.batteryState;
+    on_charger.store(state == UIDeviceBatteryStateCharging || state == UIDeviceBatteryStateFull, std::memory_order_relaxed);
+  });
+  if (charging) *charging = on_charger.load(std::memory_order_relaxed);
+  return level.load(std::memory_order_relaxed);
+}
+
+// GTAV_IOS_CLEAR_METAL_CACHE (test, native/renderer.cpp): Metal keeps the compiled shaders of this
+// app in Library/Caches/.../com.apple.metal. Called before main. Returns the bytes removed.
+extern "C" long long gtav_ios_clear_metal_cache() {
+  NSFileManager* fm = NSFileManager.defaultManager;
+  NSString* caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+  if (!caches) return 0;
+  NSMutableArray<NSString*>* found = [NSMutableArray array];
+  NSDirectoryEnumerator* walk = [fm enumeratorAtPath:caches];
+  for (NSString* rel in walk) {
+    if (![rel.lastPathComponent isEqualToString:@"com.apple.metal"]) continue;
+    [found addObject:[caches stringByAppendingPathComponent:rel]];
+    [walk skipDescendants];
+  }
+  long long bytes = 0;
+  for (NSString* dir in found) {
+    for (NSString* rel in [fm enumeratorAtPath:dir])
+      bytes += [[fm attributesOfItemAtPath:[dir stringByAppendingPathComponent:rel] error:nil] fileSize];
+    [fm removeItemAtPath:dir error:nil];
+  }
+  return bytes;
+}
+
+// BC (DXT) textures on this GPU (iOS 16.4+ reports it per device; MoltenVK passes it through as
+// textureCompressionBC): without it native/textures.cpp decodes them on the CPU.
+extern "C" int gtav_ios_supports_bc() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (!device) return 0;
+  if (@available(iOS 16.4, *)) return device.supportsBCTextureCompression ? 1 : 0;
+  return 0;
+}
 
 namespace gtav::ios_setup {
 

@@ -1182,9 +1182,11 @@ class Installer {
     if (ios_) {
       // iPhone, from any host: arm64 iOS 17, A14 or newer. The SSE intrinsics map to NEON through
       // simde (MIT, package ios/include), as on the Mac.
+      // REX_FP_SINGLE_MODE as on Android (the other arm64 phone build): no denormal-mode switch
+      // (an FPCR write) around FP instruction groups (fs/gtav_pch.h).
       flags = {L"--target=arm64-apple-ios17.0", L"-nostdinc++", L"-nostdlibinc", L"-fno-stack-protector",
                L"-O2", L"-std=gnu++23", L"-mcpu=apple-a14", L"-fno-exceptions", L"-fno-rtti",
-               L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w", L"-isystem",
+               L"-fno-threadsafe-statics", L"-fno-math-errno", L"-DREX_FP_SINGLE_MODE", L"-w", L"-isystem",
                (root_ / L"ios" / L"include").wstring()};
     } else if (android_) {
       // Android phones, from any host: aarch64, API 30, ARMv8.2 (LSE atomics; Snapdragon 845 and
@@ -1352,10 +1354,13 @@ class Installer {
  private:
   // The app's own args.txt (the SDK reads it before Documents/args.txt). No data roots: the setup
   // screen installs the game data into Documents/data (gtav_app.h OnFinalizePaths).
+  // Uncapped since 11-27 (it was 30 fps with vsync): the 13 mini runs 37-45 fps where the GPU
+  // allows. "Best image" in the menu is the steady 30 with vsync, and what the player picks
+  // there is kept in gtav_settings.ini, which is applied over these.
   static constexpr char kIphoneArgs[] =
       "--gpu_plugin=xenos --headless=true\n"
       "--gtav_native=on --gpu_skip_rendering=true --gpu_skip_rendering_lag_ms=6\n"
-      "--vsync=false --gtav_native_vsync=true --gtav_fps_limit=30\n"
+      "--vsync=false --gtav_native_vsync=false --gtav_fps_limit=0\n"
       "--audio_device_frames=256\n"
       "--log_level=info --log_file=logs/gtav.log --log_max_file_size_mb=16 --log_max_files=2\n"
       "--gtav_native_texture_budget_mb=192\n"

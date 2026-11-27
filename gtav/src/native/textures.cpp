@@ -9,7 +9,16 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/system.h>
+
+REXCVAR_DEFINE_INT32(gtav_native_texture_sample_runs, 16, "GTAV",
+                     "Runs of 256 bytes a sampled check of a large texture hashes over its base level (a "
+                     "quarter of that over the mips)");
+REXCVAR_DEFINE_INT32(gtav_native_decode_bc, -1, "GTAV",
+                     "iPhone: DXT textures decoded on the CPU (1), sampled by the GPU as BC (0), or BC when "
+                     "the GPU supports it (-1)");
 
 #define XXH_FORCE_MEMORY_ACCESS 0  // memcpy reads: the default breaks type aliasing (see backend.cpp)
 #define XXH_INLINE_ALL
@@ -36,9 +45,27 @@ enum class Convert { kNone, k565, k1555, k4444, k2_10_10_10, kBC1, kBC2, kBC3, k
 #include <TargetConditionals.h>
 #endif
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-constexpr bool kDecodeBC = true;
+}  // namespace
+}  // namespace gtav::native
+extern "C" int gtav_ios_supports_bc();  // ios_setup.mm
+namespace gtav::native {
+namespace {
+// Since iOS 16.4 an iPhone GPU may sample BC itself (supportsBCTextureCompression): then the
+// guest's DXT data is uploaded as it is, without the CPU decode and at a quarter to an eighth of
+// the memory. --gtav_native_decode_bc: -1 asks the GPU, 0 never decodes, 1 always does.
+bool DecodeBC() {
+  static const bool decode = [] {
+    const int forced = REXCVAR_GET(gtav_native_decode_bc);
+    const bool gpu = gtav_ios_supports_bc() != 0;
+    const bool d = forced >= 0 ? forced != 0 : !gpu;
+    REXLOG_INFO("[native] BC textures: {} (GPU support: {}, --gtav_native_decode_bc={})",
+                d ? "decoded on the CPU" : "sampled by the GPU", gpu ? "yes" : "no", forced);
+    return d;
+  }();
+  return decode;
+}
 #else
-constexpr bool kDecodeBC = false;
+constexpr bool DecodeBC() { return false; }
 #endif
 
 struct HostFormat {
@@ -50,23 +77,23 @@ struct HostFormat {
 bool GetHostFormat(xenos::TextureFormat format, HostFormat* out) {
   switch (rex::graphics::GetBaseFormat(format)) {
     case xenos::TextureFormat::k_DXT1:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC1, 64}
+      *out = DecodeBC() ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC1, 64}
                        : HostFormat{RenderFormat::BC1_UNORM, Convert::kNone, 8};
       return true;
     case xenos::TextureFormat::k_DXT2_3:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC2, 64}
+      *out = DecodeBC() ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC2, 64}
                        : HostFormat{RenderFormat::BC2_UNORM, Convert::kNone, 16};
       return true;
     case xenos::TextureFormat::k_DXT4_5:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC3, 64}
+      *out = DecodeBC() ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC3, 64}
                        : HostFormat{RenderFormat::BC3_UNORM, Convert::kNone, 16};
       return true;
     case xenos::TextureFormat::k_DXT5A:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8_UNORM, Convert::kBC4, 16}
+      *out = DecodeBC() ? HostFormat{RenderFormat::R8_UNORM, Convert::kBC4, 16}
                        : HostFormat{RenderFormat::BC4_UNORM, Convert::kNone, 8};
       return true;
     case xenos::TextureFormat::k_DXN:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8_UNORM, Convert::kBC5, 32}
+      *out = DecodeBC() ? HostFormat{RenderFormat::R8G8_UNORM, Convert::kBC5, 32}
                        : HostFormat{RenderFormat::BC5_UNORM, Convert::kNone, 16};
       return true;
     case xenos::TextureFormat::k_8_8_8_8: *out = {RenderFormat::R8G8B8A8_UNORM, Convert::kNone, 4}; return true;
@@ -313,8 +340,11 @@ uint64_t HashGuestTexture(const uint32_t words[6], bool sampled) {
       for (uint32_t i = 0; i < runs; i++) seed = hash_range(addr + i * step, 256, seed);
       return seed;
     };
-    uint64_t h = sample(info.memory.base_address, info.memory.base_size, 16, 1);
-    return sample(info.memory.mip_address, info.memory.mip_size, 4, h);
+    // --gtav_native_texture_sample_runs (live): runs over the base level, a quarter of that over
+    // the mips. On the iPhone each run can fault a cold page of guest memory back in (~3 us).
+    const uint32_t runs = uint32_t(std::clamp(REXCVAR_GET(gtav_native_texture_sample_runs), 2, 64));
+    uint64_t h = sample(info.memory.base_address, info.memory.base_size, runs, 1);
+    return sample(info.memory.mip_address, info.memory.mip_size, std::max(2u, runs / 4), h);
   }
   uint64_t h = hash_range(info.memory.base_address, info.memory.base_size, 1);
   return hash_range(info.memory.mip_address, info.memory.mip_size, h);
@@ -393,7 +423,7 @@ bool Decode3D(const rex::graphics::TextureInfo& info, const HostFormat& host, ui
 // A decoded DXT1 texture without transparent texels -> B5G6R5 (half the memory of RGBA8; the
 // colour came from 5:6:5 endpoints, so only the interpolated texels lose a little precision).
 static void PackOpaqueTo565(DecodedTexture* t) {
-  if (!kDecodeBC || t->format != RenderFormat::R8G8B8A8_UNORM) return;
+  if (!DecodeBC() || t->format != RenderFormat::R8G8B8A8_UNORM) return;
   for (uint32_t m = 0; m < t->mip_count; m++) {  // (not the zero padding between mips)
     const uint8_t* p = t->data.data() + t->mips[m].offset;
     const size_t bytes = size_t(t->mips[m].row_texels) * t->mips[m].height * 4;

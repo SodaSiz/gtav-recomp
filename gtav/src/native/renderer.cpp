@@ -56,7 +56,18 @@
 #endif
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_SLOW_GPU_MS_DEFAULT 80.0
+#else
+#define GTAV_SLOW_GPU_MS_DEFAULT 0.0
+#endif
+REXCVAR_DEFINE_DOUBLE(gtav_native_slow_gpu_ms, GTAV_SLOW_GPU_MS_DEFAULT, "GTAV",
+                      "Diagnostic: when the GPU frame averages over this (ms, over a 300-frame report), time the "
+                      "next 60 frames pass by pass and log the table (at most three a run; 0: never)");
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, false, "GTAV", "Native renderer: wait for vertical sync when presenting (off by default: uncapped)");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+extern "C" long long gtav_ios_clear_metal_cache();  // ios_setup.mm; bytes removed
+#endif
 REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
                     "Native renderer: no TOP_OF_PIPE / BOTTOM_OF_PIPE next to other barrier stages (MoltenVK waits less)");
 #ifdef __ANDROID__
@@ -158,6 +169,12 @@ const int g_mvk_precise_math = setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
 // New pipelines arrive in bursts of hundreds when an area or cutscene loads; Metal compiles them
 // with more threads this way (fewer frames shown from the hold, see gtav_native_hold_lost_frames).
 const int g_mvk_concurrent_compile = setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+#if TARGET_OS_IPHONE
+// GTAV_IOS_CLEAR_METAL_CACHE=1 (test): start as on a first launch, to measure the compile storm and
+// what the hold and the warm-up make of it. Metal's shader cache of this app is removed here,
+// before anything can have opened it; the saved Vulkan pipeline cache is then not loaded either.
+const long long g_metal_cache_cleared = std::getenv("GTAV_IOS_CLEAR_METAL_CACHE") ? gtav_ios_clear_metal_cache() : -1;
+#endif
 #endif
 
 #if defined(__APPLE__) || defined(__ANDROID__)
@@ -970,6 +987,14 @@ class Renderer {
   std::filesystem::path PipelineCachePath() { return ExeDir() / "shader_cache" / "vk_pipelines.bin"; }
 
   void LoadPipelineCache() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (g_metal_cache_cleared >= 0) {  // GTAV_IOS_CLEAR_METAL_CACHE
+      REXLOG_INFO("[native] GTAV_IOS_CLEAR_METAL_CACHE: Metal's shader cache removed ({} KB), the saved pipeline "
+                  "cache is not loaded",
+                  g_metal_cache_cleared >> 10);
+      return;
+    }
+#endif
     std::vector<uint8_t> data;
     if (FILE* f = std::fopen(PipelineCachePath().string().c_str(), "rb")) {
       std::fseek(f, 0, SEEK_END);
@@ -1605,7 +1630,7 @@ class Renderer {
       backend_.DrawCounter(list_, fps_value_, 8, 8, std::max(1u, h / 720), kSwapchainFormat);
     if (backend_ok_) {
       double frame_ms = fps_value_ ? 1000.0 / fps_value_ : 0.0;
-      if (ImDrawData* menu_data = menu::Frame(w, h, fps_value_, frame_ms, PendingShaders()))
+      if (ImDrawData* menu_data = menu::Frame(w, h, fps_value_, frame_ms, PendingShaders() + backend_.Preparing()))
         backend_.DrawMenu(list_, menu_data, kSwapchainFormat);
     }
     list_->barriers(plume::RenderBarrierStage::NONE,
@@ -1643,7 +1668,9 @@ class Renderer {
 #endif
     double interval = last_present_.time_since_epoch().count() ? ms(present_end - last_present_) : 0;
     last_present_ = present_end;
-    if (backend_ok_) MaybeSavePipelineCache(backend_.LastStats().pipelines_created);
+    // (the warm-up's compiles count too: after an install the cache was otherwise saved only once
+    // the frame itself had compiled something)
+    if (backend_ok_) MaybeSavePipelineCache(backend_.LastStats().pipelines_created + backend_.TakeWarmCompiled());
     if (interval > kHitchMs && backend_ok_) {
       auto st = backend_.LastStats();
       REXLOG_INFO("[native] hitch {:.1f} ms at guest frame {}: record {:.1f} ms, wait {:.1f} ms, {} new pipelines, "
@@ -1669,9 +1696,19 @@ class Renderer {
 
   // GTAV_NATIVE_SHOT_DIR (+ GTAV_SHOT_SECS, default 10, or GTAV_SHOT_FRAMES): periodic PPM captures of the native
   // front buffer, comparable with the emulated renderer's GTAV_SHOT_DIR captures.
+  // A relative GTAV_NATIVE_SHOT_DIR is under logs/ (on a phone the app's folder is unknown to the
+  // launch command: devicectl -e '{"GTAV_NATIVE_SHOT_DIR":"shots"}').
   std::string ShotDir() {
     const char* dir = std::getenv("GTAV_NATIVE_SHOT_DIR");
-    return dir && *dir ? dir : LogPath("shots");
+    if (!dir || !*dir) return LogPath("shots");
+    if (std::filesystem::path(dir).is_absolute()) return dir;
+    static const std::string under_logs = [&] {
+      std::string p = LogPath(dir);
+      std::error_code ec;
+      std::filesystem::create_directories(p, ec);
+      return p;
+    }();
+    return under_logs;
   }
 
   bool WantShot(uint64_t index) {
@@ -1841,6 +1878,15 @@ class Renderer {
                     submitter_.busy_us.exchange(0) / 1000.0 / timing_.n,
                     timing_.gpu_frames ? timing_.gpu_frame_sum / timing_.gpu_frames : 0.0,
                     timing_.gpu_frames ? timing_.gpu_gap_sum / timing_.gpu_frames : 0.0);
+        // A very slow GPU frame (11-27, 13 mini: 200-265 ms a frame for 12 minutes, facing the sun at
+        // sunset, against ~20 ms just before): one table of where it goes, at most three a run.
+        if (const double slow = REXCVAR_GET(gtav_native_slow_gpu_ms);
+            slow > 0 && slow_gpu_tables_ < 3 && timing_.gpu_frames &&
+            timing_.gpu_frame_sum / timing_.gpu_frames > slow) {
+          slow_gpu_tables_++;
+          REXLOG_INFO("[native] GPU frame over {:.0f} ms: timing the next 60 frames pass by pass", slow);
+          backend_.SamplePassTimes(60);
+        }
         plume::g_statRenderPasses = 0, plume::g_statBarriers = 0, plume::g_statLoadClears = 0;
         plume::g_statClearsInPass = 0, plume::g_statClearsPartial = 0;
         timing_ = {};
@@ -1989,6 +2035,7 @@ class Renderer {
       record_max = std::max(record_max, record), gpu_max = std::max(gpu_max, gpu);
     }
   } timing_;
+  uint32_t slow_gpu_tables_ = 0;  // --gtav_native_slow_gpu_ms tables taken this run
   std::thread thread_;
 
 #ifdef _WIN32

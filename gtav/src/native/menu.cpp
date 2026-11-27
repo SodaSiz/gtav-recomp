@@ -85,9 +85,14 @@ constexpr const char* kSettings[] = {
 
 std::filesystem::path SettingsPath() { return ExeDir() / "gtav_settings.ini"; }
 
+// Written into gtav_settings.ini; a file from an older version gets that version's corrections
+// once when it is loaded (LoadSettings).
+constexpr int kSettingsVersion = 2;
+
 void SaveSettings() {
   std::ofstream out(SettingsPath());
   out << "# GTA V native renderer settings (Esc menu). name=value, applied over the command line.\n";
+  out << "settings_version=" << kSettingsVersion << '\n';
   for (const char* name : kSettings) out << name << '=' << rex::cvar::GetFlagByName(name) << '\n';
 }
 
@@ -106,16 +111,23 @@ constexpr const char* kSafeGpuLag = "6";
 constexpr const char* kFastGpuLag = "4";
 
 void ApplyPreset(bool best) {
-#ifdef __ANDROID__
+#if GTAV_MENU_PHONE
   // Phones: the per-pixel sun tiles cost no measurable fps (same-run A/B on an Adreno 730), and
-  // without them the game's per-tile shortcut shows gray 16x16 blocks at object edges.
+  // without them the game's per-tile shortcut shows gray 16x16 blocks at object edges. (The
+  // iPhone took the desktop branch until 11-27: "Max performance" turned them off there.)
   SetBool("gtav_native_tile_penumbra_all", true);
 #else
   SetBool("gtav_native_tile_penumbra_all", best);
 #endif
   SetBool("gtav_native_async_pipelines", !best);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // iPhone 13 mini, 11-27, same-run A/B standing: 6 | 4 ms = 21.8 | 22.3 fps, b ahead in 1 of 3
+  // report lines. Nothing to gain there, so the tested value stays in both presets.
+  rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", kSafeGpuLag);
+#else
   rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", best ? kSafeGpuLag : kFastGpuLag);
-#ifdef __ANDROID__
+#endif
+#if GTAV_MENU_PHONE
   // Phones: "Best image" is also the steady one, locked at 30 fps with vsync (sustained play heats
   // the phone less and throttles later); "Max performance" runs uncapped.
   rex::cvar::SetFlagByName("gtav_fps_limit", best ? "30" : "0");
@@ -529,6 +541,7 @@ void LoadSettings() {
     return;
   }
   std::ifstream in(SettingsPath());
+  int version = 0;
   if (in) {
     std::string line;
     while (std::getline(in, line)) {
@@ -536,10 +549,34 @@ void LoadSettings() {
       auto eq = line.find('=');
       if (eq == std::string::npos) continue;
       std::string name = line.substr(0, eq), value = line.substr(eq + 1);
+      if (name == "settings_version") {
+        version = std::atoi(value.c_str());
+        continue;
+      }
       if (std::find_if(std::begin(kSettings), std::end(kSettings), [&](const char* s) { return name == s; }) ==
           std::end(kSettings))
         continue;
       if (rex::cvar::SetFlagByName(name, value)) REXLOG_INFO("[native] setting {} = {} (gtav_settings.ini)", name, value);
+    }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Version 2 (11-27): the iPhone's "Max performance" button used to turn the per-pixel sun
+    // shadows off (the desktop branch of ApplyPreset); on this renderer that is the gray 16x16
+    // blocks at object edges, flickering as the camera moves. Saved files from then get them back
+    // once; the checkbox still turns them off for whoever wants that.
+    if (version < 2 && !GetBool("gtav_native_tile_penumbra_all")) {
+      SetBool("gtav_native_tile_penumbra_all", true);
+      REXLOG_INFO("[native] settings from before version 2: per-pixel sun shadows turned back on");
+    }
+    // The same button set the emulated GPU's lag to 4 ms: no faster on the iPhone (ApplyPreset),
+    // and 6 is the value the flicker tests were made with.
+    if (version < 2 && rex::cvar::GetFlagByName("gpu_skip_rendering_lag_ms") == kFastGpuLag) {
+      rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", kSafeGpuLag);
+      REXLOG_INFO("[native] settings from before version 2: GPU lag back to {} ms", kSafeGpuLag);
+    }
+#endif
+    if (version < kSettingsVersion) {
+      in.close();
+      SaveSettings();
     }
   }
   LogEffectiveSettings(false);
@@ -603,9 +640,10 @@ ImDrawData* Frame(uint32_t w, uint32_t h, uint32_t fps, double frame_ms, uint32_
   }
   if (pending_shaders) {
     // First launch: the game's shaders are translated on this machine while it boots; the picture
-    // can stay dark until they are done. Later launches reuse them.
+    // can stay dark until they are done. Later launches reuse them. Also shown while the picture
+    // waits for pipelines (after an update the graphics driver compiles them all again).
     char text[128];
-    std::snprintf(text, sizeof(text), "Preparing shaders: %u left (first launch only)", pending_shaders);
+    std::snprintf(text, sizeof(text), "Preparing shaders: %u left", pending_shaders);
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     const ImVec2 size = ImGui::CalcTextSize(text);
     const float pad = 8.0f * g_scale;

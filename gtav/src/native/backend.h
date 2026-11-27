@@ -62,6 +62,14 @@ class Backend {
     double shader_ms, pipeline_ms, texture_ms, resolve_ms;  // time in cache misses / resolves
   };
   FrameStats LastStats() const;
+  // Pipelines still to compile while the picture waits for them (the last complete frame is being
+  // repeated, or the start-up warm-up of the last runs' pipelines is going); 0: nothing to show.
+  uint32_t Preparing() const;
+  // Pipelines the warm-up compiled since the last call (for the pipeline cache save).
+  uint32_t TakeWarmCompiled();
+  // Times the next `frames` frames pass by pass (as --gtav_native_pass_gpu_times does) and logs the
+  // table once; the renderer calls it when the GPU frame becomes very slow (--gtav_native_slow_gpu_ms).
+  void SamplePassTimes(uint32_t frames);
 
   // One line per draw of the last executed frame, for the glitch inspector (--gtav_native_flicker_catch).
   struct DrawNote {

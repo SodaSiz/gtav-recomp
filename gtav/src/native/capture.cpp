@@ -34,15 +34,20 @@
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #include <mach/mach.h>
+#include <pthread.h>
 #include <malloc/malloc.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #if TARGET_OS_IPHONE
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <os/proc.h>
 #endif
 extern "C" void* MTLCreateSystemDefaultDevice(void);
 #if TARGET_OS_IPHONE
 extern "C" int gtav_ios_thermal_state();  // ios_setup.mm
+extern "C" int gtav_ios_battery(int* charging);  // percent (-1: not known yet); ios_setup.mm
+extern "C" void gtav_ios_watch_system(void (*cb)(int kind, int value));  // ios_setup.mm
 #endif
 // Bytes the process has allocated on the (only) Metal device: MoltenVK's buffers and textures.
 static uint64_t MetalAllocatedBytes() {
@@ -100,6 +105,19 @@ REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, GTAV_FENCE_WAIT_DEFAULT, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_fence_wait_ms, GTAV_FENCE_WAIT_MS_DEFAULT, "GTAV",
                      "Longest wait of the command processor at a GPU fence for the renderer (then it copies, "
                      "or gives up for the frame being recorded; Mac: stalls past 100 ms left one-frame slabs)");
+// The copies are made for the frame the game is still building, when it waits on a fence before
+// its Swap; with a slow renderer that came in bursts of 160-310 MB of vertex data per 300 frames,
+// and the iPhone 13 mini's CPU memory jumped by 250-420 MB within a second at those bursts
+// (11-27: memory warnings at 464 MB left, and one run ended there with no report). Past this
+// many MB held in copies, a draw is not copied: the renderer reads its guest memory as Linux
+// always does (a one-frame wrong mesh at worst, against the app being closed).
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_FENCE_COPY_BUDGET_MB 96
+#else
+#define GTAV_FENCE_COPY_BUDGET_MB 0
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_fence_copy_budget_mb, GTAV_FENCE_COPY_BUDGET_MB, "GTAV",
+                     "Most MB of memory held for fence copies at once; past it draws are not copied (0: no limit)");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
                     "Experiment, with --gtav_native_fence_wait: wait only until the draw before the fence is "
                     "recorded, not its whole frame (the command processor then reaches the fences of the frame "
@@ -506,7 +524,7 @@ static std::atomic<uint32_t> g_fence_address{0};  // guest physical, where the G
 static constexpr uint32_t kDevFence = 11036;      // next fence value (InsertFence 8380E440)
 static constexpr uint32_t kDevFenceDone = 11024;  // -> where the GPU writes the completed fence
 static struct {
-  uint64_t copies = 0, bytes = 0, waits = 0, wait_timeouts = 0;
+  uint64_t copies = 0, bytes = 0, waits = 0, wait_timeouts = 0, over_budget = 0;
   double wait_ms = 0;
 } g_copy_stats;
 
@@ -594,6 +612,20 @@ static void FenceReached(uint32_t value) {
       continue;
     }
   copy:
+    if (const int budget_mb = REXCVAR_GET(gtav_native_fence_copy_budget_mb); budget_mb > 0) {
+      // Memory held, not bytes used (a few frames at most). An arena doubles when it fills, so this
+      // frame's arena past half full counts at its next size: with 96 MB no arena passes 64 MB.
+      size_t held = 0;
+      for (const auto& [frame, arena] : g_fence_arenas) {
+        held += arena.capacity();
+        if (frame == p.frame && arena.size() > arena.capacity() / 2) held += arena.capacity();
+      }
+      if (held > (size_t(budget_mb) << 20)) {
+        g_copy_stats.over_budget++;
+        g_pending_copies.pop_front();
+        continue;
+      }
+    }
     {
       FenceCopy c;
       c.d.indexed = p.indexed, c.d.index32 = p.index32, c.d.base_vertex = p.base_vertex;
@@ -601,7 +633,7 @@ static void FenceReached(uint32_t value) {
       std::copy(std::begin(p.streams), std::end(p.streams), c.d.streams);
       auto found = g_fence_arenas.find(p.frame);
       if (found == g_fence_arenas.end()) {
-        found = g_fence_arenas.emplace(p.frame, ByteArena{}).first;
+        found = g_fence_arenas.emplace(p.frame, ByteArena{nullptr}).first;
         if (!g_spare_fence_arenas.empty()) {
           found->second = std::move(g_spare_fence_arenas.back());
           g_spare_fence_arenas.pop_back();
@@ -637,7 +669,9 @@ void ApplyFenceCopies(FramePacket& f) {
        it = g_fence_arenas.erase(it)) {
     if (it->first == f.index) std::swap(f.fence_arena, it->second);
     it->second.clear();
-    if (g_spare_fence_arenas.size() < 4) g_spare_fence_arenas.push_back(std::move(it->second));
+    // A burst's big arena is let go (the next burst grows a new one) rather than kept for good.
+    if (g_spare_fence_arenas.size() < 4 && it->second.capacity() <= (size_t(32) << 20))
+      g_spare_fence_arenas.push_back(std::move(it->second));
   }
   constexpr uint32_t kFenceBit = FramePacket::kFenceBit;
   for (auto it = g_fence_copies.begin(); it != g_fence_copies.end() && it->first.first <= f.index;
@@ -663,6 +697,163 @@ void DrawsRecorded(uint32_t count) {
   }
 }
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// Big allocations, with who made them (11-27): two long runs had CPU memory (malloc) jump by
+// 250-420 MB within a second, once followed by the end of the run (jetsam, no report), and nothing
+// the renderer counts moved. With --gtav_native_big_alloc_mb=N every allocation of N MB or more is
+// kept with its thread and call stack (the hook runs inside malloc: no allocation, no lock, no
+// logging there) and logged on the next frame; allocations of 1 MB or more are summed for the
+// watch line. Off by default.
+REXCVAR_DEFINE_INT32(gtav_native_big_alloc_mb, 0, "GTAV",
+                     "iPhone: log allocations of this many MB or more with their call stack (0: off)");
+namespace big_alloc {
+constexpr int kFrames = 16;
+constexpr uint32_t kRing = 64;
+struct Entry {
+  uint64_t size, tid, us;
+  int frames;
+  char name[16];
+  void* pcs[kFrames];
+  std::atomic<uint32_t> ready;  // the entry's number + 1 once written
+};
+Entry g_ring[kRing];
+std::atomic<uint32_t> g_next{0};
+uint32_t g_shown = 0;
+std::atomic<uint64_t> g_threshold{~0ull};
+std::atomic<uint64_t> g_mb_bytes{0}, g_mb_count{0};  // allocations of 1 MB or more since the last read
+using Logger = void (*)(uint32_t type, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t result, uint32_t skip);
+}  // namespace big_alloc
+extern "C" big_alloc::Logger malloc_logger;  // libmalloc; what the allocation tools hook
+
+namespace big_alloc {
+void Hook(uint32_t type, uintptr_t, uintptr_t a2, uintptr_t a3, uintptr_t result, uint32_t) {
+  if (!(type & 2) || !result) return;              // MALLOC_LOG_TYPE_ALLOCATE
+  const uint64_t size = (type & 4) ? a3 : a2;      // realloc (ALLOCATE | DEALLOCATE): a3 = new size
+  if (size < (1u << 20)) return;
+  g_mb_bytes.fetch_add(size, std::memory_order_relaxed);
+  g_mb_count.fetch_add(1, std::memory_order_relaxed);
+  if (size < g_threshold.load(std::memory_order_relaxed)) return;
+  const uint32_t n = g_next.fetch_add(1, std::memory_order_relaxed);
+  Entry& e = g_ring[n % kRing];
+  e.ready.store(0, std::memory_order_relaxed);
+  e.size = size;
+  pthread_threadid_np(nullptr, &e.tid);
+  e.name[0] = 0;
+  pthread_getname_np(pthread_self(), e.name, sizeof(e.name));
+  e.us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+  e.frames = backtrace(e.pcs, kFrames);
+  e.ready.store(n + 1, std::memory_order_release);
+}
+
+// Frame thread: installs the hook once (and checks that it sees allocations), then logs what it
+// caught since the last call.
+void Poll() {
+  static bool installed = false;
+  const int mb = REXCVAR_GET(gtav_native_big_alloc_mb);
+  if (!installed) {
+    if (mb <= 0) return;
+    installed = true;
+    g_threshold.store(uint64_t(mb) << 20, std::memory_order_relaxed);
+    malloc_logger = Hook;
+    // The test allocation goes through a volatile pointer and is touched: the compiler removes an
+    // unused malloc/free pair (it did in the first build, and the line said the hook saw nothing).
+    static void* (*volatile do_malloc)(size_t) = std::malloc;
+    const uint32_t before = g_next.load(std::memory_order_acquire);
+    void* probe = do_malloc((size_t(mb) << 20) + 4096);
+    if (probe) static_cast<volatile char*>(probe)[0] = 1;
+    std::free(probe);
+    const bool works = g_next.load(std::memory_order_acquire) != before;
+    REXLOG_INFO("[native] big allocations: logging those of {} MB or more ({})", mb,
+                works ? "the hook saw the test allocation" : "the hook saw no test allocation");
+    g_shown = g_next.load(std::memory_order_acquire);  // not the test allocation
+    return;
+  }
+  const uint32_t next = g_next.load(std::memory_order_acquire);
+  if (next - g_shown > kRing) g_shown = next - kRing;
+  for (int logged = 0; g_shown != next && logged < 8; g_shown++, logged++) {
+    Entry& e = g_ring[g_shown % kRing];
+    if (e.ready.load(std::memory_order_acquire) != g_shown + 1) break;  // still being written
+    std::string stack;
+    for (int i = 2; i < e.frames; i++) {  // 0, 1: the hook and libmalloc
+      Dl_info info{};
+      if (dladdr(e.pcs[i], &info) && info.dli_fbase) {
+        const char* file = info.dli_fname ? std::strrchr(info.dli_fname, '/') : nullptr;
+        stack += fmt::format(" {}+{:X}", file ? file + 1 : "?",
+                             uintptr_t(e.pcs[i]) - uintptr_t(info.dli_fbase));
+        if (info.dli_sname) stack += fmt::format("({})", info.dli_sname);
+      } else {
+        stack += fmt::format(" {:X}", uintptr_t(e.pcs[i]));
+      }
+    }
+    const uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    REXLOG_INFO("[native] big allocation: {} MB on {} ({}), {} ms ago:{}", e.size >> 20,
+                e.name[0] ? e.name : "a thread", e.tid, (now_us - e.us) / 1000, stack);
+  }
+}
+}  // namespace big_alloc
+
+// Where the CPU time went since the last call: the busiest threads, in % of one core (the phone
+// has two performance cores; the game's main and render threads, the recorder and the submitter
+// all want one).
+static void LogThreadCpu(uint64_t frame) {
+  static std::unordered_map<uint64_t, uint64_t> last;  // thread id -> CPU microseconds
+  static auto last_time = std::chrono::steady_clock::now();
+  static bool first = true;  // the first call only takes the readings (no interval to report yet)
+  thread_act_array_t threads = nullptr;
+  mach_msg_type_number_t count = 0;
+  if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
+  const auto now = std::chrono::steady_clock::now();
+  const double wall_us = std::max(1.0, std::chrono::duration<double, std::micro>(now - last_time).count());
+  last_time = now;
+  struct Row {
+    uint64_t us;
+    char name[40];
+  };
+  std::vector<Row> rows;
+  std::unordered_map<uint64_t, uint64_t> seen;
+  uint64_t total = 0;
+  for (mach_msg_type_number_t i = 0; i < count; i++) {
+    thread_basic_info_data_t basic{};
+    mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT;
+    thread_identifier_info_data_t id{};
+    mach_msg_type_number_t in = THREAD_IDENTIFIER_INFO_COUNT;
+    if (thread_info(threads[i], THREAD_BASIC_INFO, thread_info_t(&basic), &bn) == KERN_SUCCESS &&
+        thread_info(threads[i], THREAD_IDENTIFIER_INFO, thread_info_t(&id), &in) == KERN_SUCCESS) {
+      const uint64_t us = uint64_t(basic.user_time.seconds + basic.system_time.seconds) * 1000000ull +
+                          uint64_t(basic.user_time.microseconds + basic.system_time.microseconds);
+      seen[id.thread_id] = us;
+      auto was = last.find(id.thread_id);
+      const uint64_t used = was == last.end() ? us : us > was->second ? us - was->second : 0;
+      if (used) {
+        Row row{used, {}};
+        if (pthread_t p = pthread_from_mach_thread_np(threads[i])) pthread_getname_np(p, row.name, sizeof(row.name));
+        if (!row.name[0])
+          std::snprintf(row.name, sizeof(row.name), "thread %llx", static_cast<unsigned long long>(id.thread_id));
+        rows.push_back(row);
+        total += used;
+      }
+    }
+    mach_port_deallocate(mach_task_self(), threads[i]);
+  }
+  vm_deallocate(mach_task_self(), vm_address_t(threads), count * sizeof(thread_act_t));
+  last.swap(seen);
+  if (first) {
+    first = false;
+    return;
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.us > b.us; });
+  std::string list;
+  for (size_t i = 0; i < rows.size() && i < 14; i++)
+    list += fmt::format("{}{} {:.0f}", i ? ", " : "", rows[i].name, double(rows[i].us) / wall_us * 100.0);
+  REXLOG_INFO("[native] threads at frame {}: {} threads used {:.0f}% of one core since the last line: {}", frame, count,
+              double(total) / wall_us * 100.0, list);
+}
+#endif
+
 void FenceCopiesRecorded(uint64_t frame) {
   {
     std::lock_guard lock(g_copy_mutex);
@@ -670,6 +861,44 @@ void FenceCopiesRecorded(uint64_t frame) {
     g_copy_floor = frame + 1;
     DrainIncomingCopies();
     while (!g_pending_copies.empty() && g_pending_copies.front().frame <= frame) g_pending_copies.pop_front();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // What the system reports, as it happens (thermal state changes, memory warnings), and while
+    // the phone is hot or short of memory a short line every 30 frames: three long runs ended
+    // with no report (11-27) and the memory line every 120 frames left the last seconds unseen.
+    static const char* kThermalName[] = {"nominal", "fair", "serious", "critical"};
+    big_alloc::Poll();
+    gtav_ios_watch_system([](int kind, int value) {
+      if (kind == 0)
+        REXLOG_INFO("[native] iOS: thermal state now {} (available {} MB)", kThermalName[std::clamp(value, 0, 3)],
+                    os_proc_available_memory() >> 20);
+      else
+        REXLOG_INFO("[native] iOS: memory warning (available {} MB)", os_proc_available_memory() >> 20);
+    });
+    // Once a second (by the clock: a slow GPU made 30 frames 7 s on 11-27, and the end came within
+    // 9 s of a 420 MB jump that the line did not split up).
+    static auto last_watch = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now();
+        now - last_watch >= std::chrono::seconds(1) &&
+        (gtav_ios_thermal_state() >= 2 || os_proc_available_memory() < (uint64_t(700) << 20))) {
+      last_watch = now;
+      task_vm_info_data_t vm{};
+      mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+      if (task_info(mach_task_self(), TASK_VM_INFO, task_info_t(&vm), &n) == KERN_SUCCESS) {
+        malloc_statistics_t ms{};
+        malloc_zone_statistics(nullptr, &ms);
+        const uint64_t big_bytes = big_alloc::g_mb_bytes.exchange(0, std::memory_order_relaxed);
+        const uint64_t big_count = big_alloc::g_mb_count.exchange(0, std::memory_order_relaxed);
+        REXLOG_INFO("[native] watch at frame {}: footprint {} MB, available {} MB, Metal {} MB, malloc {} MB, "
+                    "compressed {} MB, resident {} MB (file {} MB), thermal {}{}",
+                    frame, vm.phys_footprint >> 20, os_proc_available_memory() >> 20, MetalAllocatedBytes() >> 20,
+                    ms.size_in_use >> 20, vm.compressed >> 20, vm.resident_size >> 20, vm.external >> 20,
+                    kThermalName[std::clamp(gtav_ios_thermal_state(), 0, 3)],
+                    malloc_logger ? fmt::format("; {} allocations of 1 MB+ ({} MB) since the last line", big_count,
+                                                big_bytes >> 20)
+                                  : std::string());
+      }
+    }
+#endif
 #if defined(__APPLE__)
     if (frame % 120 == 0) {
       // phys_footprint is what jetsam counts; os_proc_available_memory is the headroom left (iOS).
@@ -681,11 +910,24 @@ void FenceCopiesRecorded(uint64_t frame) {
         malloc_zone_statistics(nullptr, &ms);
         // Thermal state (NSProcessInfo: 0 nominal .. 3 critical): a hot phone throttles the GPU 2x+.
         static const char* kThermal[] = {"nominal", "fair", "serious", "critical"};
+        // Faults and page-ins since the last line: the guest memory is a file-backed shared mapping
+        // here (the sandbox denies shm_open), so pages the system evicted come back from flash.
+        // "file" is resident file-backed memory (the guest memory among it).
+        static task_events_info_data_t last_ev{};
+        task_events_info_data_t ev{};
+        mach_msg_type_number_t en = TASK_EVENTS_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_EVENTS_INFO, task_info_t(&ev), &en) != KERN_SUCCESS) ev = last_ev;
+        int charging = 0;
+        const int battery = gtav_ios_battery(&charging);
         REXLOG_INFO("[native] memory at frame {}: footprint {} MB, available {} MB, compressed {} MB; Metal {} MB, "
-                    "malloc {} MB; thermal {}",
+                    "malloc {} MB; thermal {}; resident {} MB (file {} MB); since the last line {} faults, {} "
+                    "page-ins; battery {}%{}",
                     frame, vm.phys_footprint >> 20, os_proc_available_memory() >> 20, vm.compressed >> 20,
                     MetalAllocatedBytes() >> 20, ms.size_in_use >> 20,
-                    kThermal[std::clamp(gtav_ios_thermal_state(), 0, 3)]);
+                    kThermal[std::clamp(gtav_ios_thermal_state(), 0, 3)], vm.resident_size >> 20, vm.external >> 20,
+                    ev.faults - last_ev.faults, ev.pageins - last_ev.pageins, battery, charging ? " (charging)" : "");
+        last_ev = ev;
+        LogThreadCpu(frame);
 #else
         REXLOG_INFO("[native] memory at frame {}: footprint {} MB, compressed {} MB", frame, vm.phys_footprint >> 20,
                     vm.compressed >> 20);
@@ -695,10 +937,11 @@ void FenceCopiesRecorded(uint64_t frame) {
 #endif
     if (frame % 300 == 0) {
       auto& st = g_copy_stats;
-      REXLOG_INFO("[native] fence copies per 300 frames: {} draws ({} KB), GPU waited for the renderer {} times "
-                  "({:.1f} ms, {} timeouts), {} queued; packet arenas grew {} times ({} MB moved)",
-                  st.copies, st.bytes / 1024, st.waits, st.wait_ms, st.wait_timeouts, g_pending_copies.size(),
-                  g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20);
+      REXLOG_INFO("[native] fence copies per 300 frames: {} draws ({} KB, {} more not copied: over the budget), "
+                  "GPU waited for the renderer {} times ({:.1f} ms, {} timeouts), {} queued; packet arenas grew {} "
+                  "times ({} MB moved)",
+                  st.copies, st.bytes / 1024, st.over_budget, st.waits, st.wait_ms, st.wait_timeouts,
+                  g_pending_copies.size(), g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20);
       st = {};
     }
   }

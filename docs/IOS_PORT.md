@@ -123,6 +123,28 @@ Measured with the game's own log lines (`memory at frame`, `record ms per frame`
   hitch log only past 50 ms on phones, logs rotate at 16 MB (`devicectl copy from` stalls on files
   past ~20 MB; when the phone's file service wedges, replug the cable).
 
+### 2026-11-27: uncapped, 37-45 fps on foot (iPhone 13 mini)
+
+Full tables and what was tried: `docs/HANDOFF_MAC_2026-11-23.md`, "iPhone speed and flicker".
+
+- The app runs uncapped by default (args.txt; "Best image" in the menu is 30 fps with vsync).
+  Standing 44.7-45.5 fps in light scenes, 27-30 in the heaviest start scene; a scripted walk
+  37-41 fps. Thermal state "serious" comes about 3 minutes into a run and costs about a third.
+- The game code is built with `-DREX_FP_SINGLE_MODE` and the shell with `-DGTAV_D3D_PROBES=OFF`
+  (the CMake default on iOS; an existing build directory keeps its cached ON: reconfigure).
+- The internal resolution is 960x540 (`--gtav_native_render_scale`, 0.75 on phones; the line in
+  the 10-31 list about every shader needing a change is out of date). It is not what limits the
+  GPU: with a flat pixel shader on every draw the GPU frame is 19.3 ms instead of 19.9. The time is
+  per render pass and per draw; 162-190 passes a frame.
+- Guest memory is still the file mapping. `--ios_guest_memory=anon` ends the page-ins and costs
+  280 MB of footprint for no frame rate on a 4 GB phone; `auto` picks it from 3,000 MB of headroom.
+- Flicker: frames are no longer shown with draws missing while their pipelines compile; the last
+  complete frame stays up (up to 5 s; "Preparing shaders: N left" at the start). The log counts
+  "frame N shown with missing draws". `GTAV_IOS_CLEAR_METAL_CACHE=1` in the launch environment
+  starts with Metal's shader cache removed, to test a first launch after a shader change.
+- `gtav_settings.ini` has `settings_version`; version 2 turns the per-pixel sun shadows back on
+  and the GPU lag back to 6 once for files saved by the old "Max performance" button.
+
 ## Release (built and tested on the Mac 2026-10-31/11-01; the ipa not yet sideloaded)
 
 **Any PC builds the ipa** (2026-11-01): the iPhone step is one code path in install.cpp for

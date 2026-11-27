@@ -45,8 +45,13 @@ REXCVAR_DECLARE(bool, gtav_wait_profile);
 // 35.6 | 34.0, 29.7 | 30.0 and at quarter size (the game's code sets the frame) 65.0 | 68.7,
 // 86.3 | 105.4, 96.1 | 105.4, 66.4 | 69.1, 57.6 | 57.5, 61.1 | 59.5, 62.9 | 67.7. Main thread on Linux
 // 97% -> 41% of a core; on the phone 21-47 -> 16-17 M instructions a frame.
-// On for Linux and Android (measured there); the other platforms keep the spin until tested.
-#if defined(__linux__)
+// On for Linux and Android (measured there) and the iPhone (13 mini 11-27, same-run A/B spin |
+// sleep after 200 us: standing 40.9 | 42.4 fps, both report lines; scripted run 25.2 | 25.6 with
+// recording 18.1 | 14.8 ms); the other platforms keep the spin until tested.
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__linux__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
 #define GTAV_FENCE_BLOCK_DEFAULT 200
 #else
 #define GTAV_FENCE_BLOCK_DEFAULT -1
