@@ -2768,6 +2768,7 @@ struct Backend::Impl {
   std::vector<std::string> pass_labels[Backend::kFramesInFlight];
   std::unordered_map<std::string, std::pair<double, uint32_t>> pass_gpu;  // label -> ms, passes
   uint32_t pass_gpu_frames = 0;
+  uint32_t pass_auto_frames = 0;  // SamplePassTimes: the window of a one-off table (0: none asked)
   void PassStamp(RenderCommandList* list, std::string label) {
     if (!pass_times) return;
     auto& labels = pass_labels[slot];
@@ -7055,7 +7056,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.converter = REXCVAR_GET(gtav_native_convert_threads) > 0 ? s.converter_pool.get() : nullptr;
   s.bound_fb = nullptr;
   s.pass_end = "frame start";
-  s.pass_times = REXCVAR_GET(gtav_native_pass_gpu_times) && s.pass_labels[s.slot].empty();
+  s.pass_times = (REXCVAR_GET(gtav_native_pass_gpu_times) || s.pass_auto_frames) && s.pass_labels[s.slot].empty();
   if (s.pass_times) {
     if (!s.pass_pools[s.slot]) s.pass_pools[s.slot] = s.device->createQueryPool(Impl::kPassStamps);
     list->resetQueryPool(s.pass_pools[s.slot].get(), 0, Impl::kPassStamps);
@@ -7387,6 +7388,14 @@ uint32_t Backend::Preparing() const {
 
 uint32_t Backend::TakeWarmCompiled() { return impl_->pipeline_warmer.TakeCompiled(); }
 
+void Backend::SamplePassTimes(uint32_t frames) {  // render thread
+  if (!impl_->pass_auto_frames && !REXCVAR_GET(gtav_native_pass_gpu_times)) {
+    impl_->pass_gpu.clear();
+    impl_->pass_gpu_frames = 0;
+    impl_->pass_auto_frames = std::max(1u, frames);
+  }
+}
+
 Backend::FrameStats Backend::LastStats() const {
   return {impl_->stat_draws, impl_->stat_skipped, impl_->stat_pipelines_created, impl_->stat_textures,
           impl_->stat_rewritten, impl_->t_shader, impl_->t_pipeline, impl_->t_texture, impl_->t_resolve};
@@ -7405,19 +7414,22 @@ void Backend::FrameComplete(uint32_t slot) {
       e.second++;
     }
     labels.clear();
-    if (++s.pass_gpu_frames == 300) {
+    const uint32_t window = s.pass_auto_frames ? s.pass_auto_frames : 300;
+    if (++s.pass_gpu_frames >= window) {
       std::vector<std::pair<double, std::string>> v;
       double total = 0;
       for (auto& [k, e] : s.pass_gpu) {
-        v.emplace_back(e.first, fmt::format("{} ({:.1f} passes)", k, e.second / 300.0));
+        v.emplace_back(e.first, fmt::format("{} ({:.1f} passes)", k, double(e.second) / window));
         total += e.first;
       }
       std::sort(v.rbegin(), v.rend());
-      REXLOG_INFO("[native] GPU by pass kind, ms per frame over 300 frames (total {:.2f}):", total / 300);
+      REXLOG_INFO("[native] GPU by pass kind, ms per frame over {} frames (total {:.2f}){}:", window, total / window,
+                  s.pass_auto_frames ? " (taken because the GPU frame was slow)" : "");
       for (size_t i = 0; i < v.size() && i < 30; i++)
-        REXLOG_INFO("[native]   GPUPASS {:6.2f} ms  {}", v[i].first / 300, v[i].second);
+        REXLOG_INFO("[native]   GPUPASS {:6.2f} ms  {}", v[i].first / window, v[i].second);
       s.pass_gpu.clear();
       s.pass_gpu_frames = 0;
+      s.pass_auto_frames = 0;
     }
   }
   if (auto& records = impl_->query_records[slot]; !records.empty()) {

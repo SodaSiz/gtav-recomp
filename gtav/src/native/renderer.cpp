@@ -56,6 +56,14 @@
 #endif
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_SLOW_GPU_MS_DEFAULT 80.0
+#else
+#define GTAV_SLOW_GPU_MS_DEFAULT 0.0
+#endif
+REXCVAR_DEFINE_DOUBLE(gtav_native_slow_gpu_ms, GTAV_SLOW_GPU_MS_DEFAULT, "GTAV",
+                      "Diagnostic: when the GPU frame averages over this (ms, over a 300-frame report), time the "
+                      "next 60 frames pass by pass and log the table (at most three a run; 0: never)");
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, false, "GTAV", "Native renderer: wait for vertical sync when presenting (off by default: uncapped)");
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 extern "C" long long gtav_ios_clear_metal_cache();  // ios_setup.mm; bytes removed
@@ -1870,6 +1878,15 @@ class Renderer {
                     submitter_.busy_us.exchange(0) / 1000.0 / timing_.n,
                     timing_.gpu_frames ? timing_.gpu_frame_sum / timing_.gpu_frames : 0.0,
                     timing_.gpu_frames ? timing_.gpu_gap_sum / timing_.gpu_frames : 0.0);
+        // A very slow GPU frame (11-27, 13 mini: 200-265 ms a frame for 12 minutes, facing the sun at
+        // sunset, against ~20 ms just before): one table of where it goes, at most three a run.
+        if (const double slow = REXCVAR_GET(gtav_native_slow_gpu_ms);
+            slow > 0 && slow_gpu_tables_ < 3 && timing_.gpu_frames &&
+            timing_.gpu_frame_sum / timing_.gpu_frames > slow) {
+          slow_gpu_tables_++;
+          REXLOG_INFO("[native] GPU frame over {:.0f} ms: timing the next 60 frames pass by pass", slow);
+          backend_.SamplePassTimes(60);
+        }
         plume::g_statRenderPasses = 0, plume::g_statBarriers = 0, plume::g_statLoadClears = 0;
         plume::g_statClearsInPass = 0, plume::g_statClearsPartial = 0;
         timing_ = {};
@@ -2018,6 +2035,7 @@ class Renderer {
       record_max = std::max(record_max, record), gpu_max = std::max(gpu_max, gpu);
     }
   } timing_;
+  uint32_t slow_gpu_tables_ = 0;  // --gtav_native_slow_gpu_ms tables taken this run
   std::thread thread_;
 
 #ifdef _WIN32

@@ -67,6 +67,9 @@ class Backend {
   uint32_t Preparing() const;
   // Pipelines the warm-up compiled since the last call (for the pipeline cache save).
   uint32_t TakeWarmCompiled();
+  // Times the next `frames` frames pass by pass (as --gtav_native_pass_gpu_times does) and logs the
+  // table once; the renderer calls it when the GPU frame becomes very slow (--gtav_native_slow_gpu_ms).
+  void SamplePassTimes(uint32_t frames);
 
   // One line per draw of the last executed frame, for the glitch inspector (--gtav_native_flicker_catch).
   struct DrawNote {
