@@ -117,7 +117,7 @@ REXCVAR_DEFINE_INT32(gtav_native_fence_wait_ms, GTAV_FENCE_WAIT_MS_DEFAULT, "GTA
 #define GTAV_FENCE_COPY_BUDGET_MB 0
 #endif
 REXCVAR_DEFINE_INT32(gtav_native_fence_copy_budget_mb, GTAV_FENCE_COPY_BUDGET_MB, "GTAV",
-                     "Most MB of draw data held in fence copies at once; past it draws are not copied (0: no limit)");
+                     "Most MB of memory held for fence copies at once; past it draws are not copied (0: no limit)");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
                     "Experiment, with --gtav_native_fence_wait: wait only until the draw before the fence is "
                     "recorded, not its whole frame (the command processor then reaches the fences of the frame "
@@ -613,9 +613,14 @@ static void FenceReached(uint32_t value) {
     }
   copy:
     if (const int budget_mb = REXCVAR_GET(gtav_native_fence_copy_budget_mb); budget_mb > 0) {
-      size_t held = 0;  // a few frames at most
-      for (const auto& [frame, arena] : g_fence_arenas) held += arena.size();
-      if (held >= (size_t(budget_mb) << 20)) {
+      // Memory held, not bytes used (a few frames at most). An arena doubles when it fills, so this
+      // frame's arena past half full counts at its next size: with 96 MB no arena passes 64 MB.
+      size_t held = 0;
+      for (const auto& [frame, arena] : g_fence_arenas) {
+        held += arena.capacity();
+        if (frame == p.frame && arena.size() > arena.capacity() / 2) held += arena.capacity();
+      }
+      if (held > (size_t(budget_mb) << 20)) {
         g_copy_stats.over_budget++;
         g_pending_copies.pop_front();
         continue;
