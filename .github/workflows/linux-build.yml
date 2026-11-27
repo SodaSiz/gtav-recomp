@@ -63,20 +63,20 @@ jobs:
             libzstd-dev \
             libxml2-dev
 
+
       - name: Install LLVM 19.1.5
-        shell: bash
         run: |
-          LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/LLVM-19.1.5-Linux-X64.tar.xz"
+          cd "$RUNNER_TEMP"
+          curl -L \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/LLVM-19.1.5-Linux-X64.tar.xz \
+            -o llvm.tar.xz
 
           mkdir -p "$RUNNER_TEMP/llvm"
-          curl -L "$LLVM_URL" -o "$RUNNER_TEMP/llvm.tar.xz"
-
-          tar -xf "$RUNNER_TEMP/llvm.tar.xz" \
+          tar -xf llvm.tar.xz \
             --strip-components=1 \
             -C "$RUNNER_TEMP/llvm"
 
-          test -x "$RUNNER_TEMP/llvm/bin/clang++"
-          test -x "$RUNNER_TEMP/llvm/bin/lld"
+          echo "$RUNNER_TEMP/llvm/bin" >> "$GITHUB_PATH"
 
       - name: Fetch and prepare ReXGlue SDK
         run: |
