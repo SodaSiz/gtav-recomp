@@ -77,6 +77,13 @@ jobs:
 
           echo "$RUNNER_TEMP/llvm/bin" >> "$GITHUB_PATH"
 
+          # Prepare LLVM license required by the release packager
+          mkdir -p "$GITHUB_WORKSPACE/licenses"
+          cp "$RUNNER_TEMP/llvm/LICENSE.TXT" \
+             "$GITHUB_WORKSPACE/licenses/LLVM.txt"
+
+          test -s "$GITHUB_WORKSPACE/licenses/LLVM.txt"
+
       - name: Fetch and prepare ReXGlue SDK
         run: |
           mkdir -p "$RUNNER_TEMP/deps"
