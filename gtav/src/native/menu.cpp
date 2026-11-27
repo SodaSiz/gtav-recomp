@@ -603,9 +603,10 @@ ImDrawData* Frame(uint32_t w, uint32_t h, uint32_t fps, double frame_ms, uint32_
   }
   if (pending_shaders) {
     // First launch: the game's shaders are translated on this machine while it boots; the picture
-    // can stay dark until they are done. Later launches reuse them.
+    // can stay dark until they are done. Later launches reuse them. Also shown while the picture
+    // waits for pipelines (after an update the graphics driver compiles them all again).
     char text[128];
-    std::snprintf(text, sizeof(text), "Preparing shaders: %u left (first launch only)", pending_shaders);
+    std::snprintf(text, sizeof(text), "Preparing shaders: %u left", pending_shaders);
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     const ImVec2 size = ImGui::CalcTextSize(text);
     const float pad = 8.0f * g_scale;

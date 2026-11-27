@@ -57,6 +57,9 @@
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, false, "GTAV", "Native renderer: wait for vertical sync when presenting (off by default: uncapped)");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+extern "C" long long gtav_ios_clear_metal_cache();  // ios_setup.mm; bytes removed
+#endif
 REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
                     "Native renderer: no TOP_OF_PIPE / BOTTOM_OF_PIPE next to other barrier stages (MoltenVK waits less)");
 #ifdef __ANDROID__
@@ -158,6 +161,12 @@ const int g_mvk_precise_math = setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
 // New pipelines arrive in bursts of hundreds when an area or cutscene loads; Metal compiles them
 // with more threads this way (fewer frames shown from the hold, see gtav_native_hold_lost_frames).
 const int g_mvk_concurrent_compile = setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+#if TARGET_OS_IPHONE
+// GTAV_IOS_CLEAR_METAL_CACHE=1 (test): start as on a first launch, to measure the compile storm and
+// what the hold and the warm-up make of it. Metal's shader cache of this app is removed here,
+// before anything can have opened it; the saved Vulkan pipeline cache is then not loaded either.
+const long long g_metal_cache_cleared = std::getenv("GTAV_IOS_CLEAR_METAL_CACHE") ? gtav_ios_clear_metal_cache() : -1;
+#endif
 #endif
 
 #if defined(__APPLE__) || defined(__ANDROID__)
@@ -970,6 +979,14 @@ class Renderer {
   std::filesystem::path PipelineCachePath() { return ExeDir() / "shader_cache" / "vk_pipelines.bin"; }
 
   void LoadPipelineCache() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (g_metal_cache_cleared >= 0) {  // GTAV_IOS_CLEAR_METAL_CACHE
+      REXLOG_INFO("[native] GTAV_IOS_CLEAR_METAL_CACHE: Metal's shader cache removed ({} KB), the saved pipeline "
+                  "cache is not loaded",
+                  g_metal_cache_cleared >> 10);
+      return;
+    }
+#endif
     std::vector<uint8_t> data;
     if (FILE* f = std::fopen(PipelineCachePath().string().c_str(), "rb")) {
       std::fseek(f, 0, SEEK_END);
@@ -1605,7 +1622,7 @@ class Renderer {
       backend_.DrawCounter(list_, fps_value_, 8, 8, std::max(1u, h / 720), kSwapchainFormat);
     if (backend_ok_) {
       double frame_ms = fps_value_ ? 1000.0 / fps_value_ : 0.0;
-      if (ImDrawData* menu_data = menu::Frame(w, h, fps_value_, frame_ms, PendingShaders()))
+      if (ImDrawData* menu_data = menu::Frame(w, h, fps_value_, frame_ms, PendingShaders() + backend_.Preparing()))
         backend_.DrawMenu(list_, menu_data, kSwapchainFormat);
     }
     list_->barriers(plume::RenderBarrierStage::NONE,
@@ -1643,7 +1660,9 @@ class Renderer {
 #endif
     double interval = last_present_.time_since_epoch().count() ? ms(present_end - last_present_) : 0;
     last_present_ = present_end;
-    if (backend_ok_) MaybeSavePipelineCache(backend_.LastStats().pipelines_created);
+    // (the warm-up's compiles count too: after an install the cache was otherwise saved only once
+    // the frame itself had compiled something)
+    if (backend_ok_) MaybeSavePipelineCache(backend_.LastStats().pipelines_created + backend_.TakeWarmCompiled());
     if (interval > kHitchMs && backend_ok_) {
       auto st = backend_.LastStats();
       REXLOG_INFO("[native] hitch {:.1f} ms at guest frame {}: record {:.1f} ms, wait {:.1f} ms, {} new pipelines, "

@@ -284,6 +284,36 @@ REXCVAR_DEFINE_INT32(gtav_native_max_anisotropy, 16, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_hold_max_frames, GTAV_HOLD_MAX_DEFAULT, "GTAV",
                      "Native renderer (live): longest run of frames --gtav_native_hold_lost_frames repeats before "
                      "showing live frames (with the draws still compiling missing) until a complete frame");
+// iPhone: with a cold Metal shader cache (first launch, some updates) a pipeline compile takes
+// about a second (MoltenVK + Metal on an A15; 13 mini, 11-27, cache removed: 0.9-1.0 s on average,
+// 3.3 s the longest of the first hundred), so half a second of repeated frame ran out during every
+// loading burst and frames with draws missing were shown (the flicker). The repeat now lasts up
+// to 5 s there, and while it lasts a frame waits longer for its pipelines: it is not shown anyway.
+// (At 3 s that run still showed 8 frames with holes, once, behind a compile of about 3.4 s.)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_HOLD_MAX_MS_DEFAULT 5000
+#define GTAV_WARM_GATE_DEFAULT 300
+#else
+#define GTAV_HOLD_MAX_MS_DEFAULT 0
+#define GTAV_WARM_GATE_DEFAULT 0
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_hold_max_ms, GTAV_HOLD_MAX_MS_DEFAULT, "GTAV",
+                     "Native renderer (live): --gtav_native_hold_lost_frames repeats the last complete frame for "
+                     "at least this long (and --gtav_native_hold_max_frames frames) before frames with draws "
+                     "missing are shown");
+REXCVAR_DEFINE_DOUBLE(gtav_native_hold_wait_ms, 150.0, "GTAV",
+                      "Native renderer (live): while the last complete frame is being repeated, a frame waits up "
+                      "to this long in total for its pipelines (--gtav_native_pipeline_wait_ms otherwise)");
+REXCVAR_DEFINE_INT32(gtav_native_warm_gate_s, GTAV_WARM_GATE_DEFAULT, "GTAV",
+                     "Pipeline warm-up: for up to this many seconds after the start, while the pipelines the last "
+                     "runs used are still compiling, a frame that lost draws is never shown: the last complete "
+                     "frame stays up under a 'Preparing shaders' line (0: off)");
+REXCVAR_DEFINE_INT32(gtav_native_warm_keep_runs, 12, "GTAV",
+                     "Pipeline warm-up: a saved pipeline no run has used for this many runs is dropped from the "
+                     "list (0: keep all)");
+REXCVAR_DEFINE_INT32(gtav_native_hash_qos, 0, "GTAV",
+                     "Apple (live): scheduling class of the --gtav_native_hash_threads workers. 0: default, "
+                     "1: utility, 2: user-initiated, 3: user-interactive (the render thread's)");
 REXCVAR_DEFINE_INT32(gtav_native_texture_min_lod, 0, "GTAV",
                      "Native renderer (live): mip levels skipped at the top of mipmapped textures (0 = full "
                      "resolution, 1 = half; cuts texture bandwidth on phones)");
@@ -1171,6 +1201,8 @@ class PipelineWarmer {
       std::fclose(f);
     }
     size_t valid = 0;  // bytes of whole records (a crash can leave a partial last one)
+    std::vector<std::shared_ptr<Record>> all;  // in file order
+    bool duplicates = false;
     for (size_t at = 0; at + 32 <= data.size();) {
       uint32_t magic, size;
       std::memcpy(&magic, &data[at], 4);
@@ -1186,21 +1218,131 @@ class PipelineWarmer {
       if (!known_.insert(rec->key).second) {  // re-recorded after a description change: the last one wins
         auto& old = *records_[rec->key];
         old.vs = rec->vs, old.ps = rec->ps, old.bytes = std::move(rec->bytes);
+        duplicates = true;
         continue;
       }
+      rec->order = uint32_t(all.size());
       records_[rec->key] = rec;
-      queue_.push_back(rec);
+      all.push_back(rec);
     }
-    file_ = std::fopen(file.string().c_str(), valid == data.size() ? "ab" : "wb");
-    if (file_ && valid != data.size() && valid) std::fwrite(data.data(), 1, valid, file_);
+    // Which run used each pipeline last, and how early in it (pipelines_used.bin, written while
+    // playing). The list only ever grew: after a few updates most of it was pipelines of shader
+    // variants and areas no run touches any more, all compiled again at every start (2,644 on the
+    // owner's phone for a scene that uses 313). Pipelines unused for --gtav_native_warm_keep_runs
+    // runs are dropped; the ones the last three runs used compile first, in the order the last
+    // run needed them (boot screens, then the world), ahead of everything else.
+    used_file_ = file.parent_path() / "pipelines_used.bin";
+    LoadUses();
+    const uint32_t keep = uint32_t(std::max(0, REXCVAR_GET(gtav_native_warm_keep_runs)));
+    uint32_t dropped = 0, first = 0;
+    for (auto& rec : all) {
+      auto use = uses_.find(rec->key);
+      rec->last_run = use != uses_.end() ? use->second.run : 0;
+      if (use != uses_.end()) rec->order = use->second.order;
+      if (keep && run_ > keep && rec->last_run + keep < run_) {
+        dropped++;
+        known_.erase(rec->key);
+        records_.erase(rec->key);
+        uses_.erase(rec->key);
+        rec.reset();
+        continue;
+      }
+      rec->priority = rec->last_run && rec->last_run + 3 >= run_;
+      first += rec->priority;
+    }
+    std::erase(all, nullptr);
+    if (valid != data.size() || dropped || duplicates) {  // rewritten whole, without the dead records
+      const std::string tmp = file.string() + ".tmp";
+      if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+        bool ok = true;
+        for (auto& rec : all) {
+          uint32_t head[2] = {kMagic, uint32_t(24 + rec->bytes.size())};
+          ok &= std::fwrite(head, 4, 2, f) == 2 && std::fwrite(&rec->key, 8, 1, f) == 1 &&
+                std::fwrite(&rec->vs, 8, 1, f) == 1 && std::fwrite(&rec->ps, 8, 1, f) == 1 &&
+                (rec->bytes.empty() || std::fwrite(rec->bytes.data(), 1, rec->bytes.size(), f) == rec->bytes.size());
+        }
+        ok &= std::fclose(f) == 0;
+        if (ok) std::filesystem::rename(tmp, file, ec);
+        if (!ok || ec) std::filesystem::remove(tmp, ec);
+      }
+    }
+    file_ = std::fopen(file.string().c_str(), "ab");
+    // Recently used first (the last run's before the one before it, each in its order of use);
+    // then the rest, newest record first.
+    std::stable_sort(all.begin(), all.end(), [](const auto& a, const auto& b) {
+      if (a->priority != b->priority) return a->priority;
+      if (a->last_run != b->last_run) return a->last_run > b->last_run;
+      return a->last_run ? a->order < b->order : a->order > b->order;
+    });
+    for (auto& rec : all) queue_.push_back(rec);
     total_ = uint32_t(queue_.size());
+    start_ = std::chrono::steady_clock::now();
     if (queue_.empty()) return;
     remaining_ = total_;
-    start_ = std::chrono::steady_clock::now();
-    REXLOG_INFO("[native] pipeline warm-up: compiling {} pipelines from earlier runs", total_);
-    workers_ = 4;
-    for (int i = 0; i < 4; i++) std::thread([this] { Worker(); }).detach();
+    const int gate_s = REXCVAR_GET(gtav_native_warm_gate_s);
+    first_total_ = first;
+    if (gate_s > 0) {
+      gate_left_.store(first, std::memory_order_release);
+      gate_until_ = start_ + std::chrono::seconds(gate_s);
+    }
+    REXLOG_INFO("[native] pipeline warm-up: compiling {} pipelines from earlier runs ({} of them used in the last 3 "
+                "runs go first; {} unused for {} runs dropped; run {})",
+                total_, first, dropped, keep, run_);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    constexpr int kWorkers = 6;  // as many as the frame's own compiles (PipelineCompiler)
+#else
+    constexpr int kWorkers = 4;
+#endif
+    workers_ = kWorkers;
+    for (int i = 0; i < kWorkers; i++) std::thread([this] { Worker(); }).detach();
   }
+
+  // The pipeline `key` is needed this run (first use only does anything).
+  void Used(uint64_t key) {
+    auto& u = uses_[key];
+    if (u.run == run_) return;
+    u = {run_, use_order_++};
+    uses_dirty_ = true;
+  }
+
+  // Once a frame (render thread): pipelines_used.bin follows the uses, at most every 10 s (iOS ends
+  // the app without notice, so there is no "at exit").
+  void Tick() {
+    if (!uses_dirty_ || used_file_.empty()) return;
+    auto now = std::chrono::steady_clock::now();
+    if (now - uses_saved_ < std::chrono::seconds(10)) return;
+    if (uses_saving_.exchange(true)) return;
+    uses_saved_ = now;
+    uses_dirty_ = false;
+    std::vector<uint8_t> out(8 + uses_.size() * 16);
+    const uint32_t head[2] = {kUsedMagic, run_};
+    std::memcpy(out.data(), head, 8);
+    size_t at = 8;
+    for (const auto& [key, use] : uses_) {
+      std::memcpy(&out[at], &key, 8);
+      std::memcpy(&out[at + 8], &use, 8);
+      at += 16;
+    }
+    std::thread([this, out = std::move(out)] {
+      const std::string tmp = used_file_.string() + ".tmp";
+      std::error_code ec;
+      bool ok = false;
+      if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+        ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+        ok &= std::fclose(f) == 0;
+      }
+      if (ok) std::filesystem::rename(tmp, used_file_, ec);
+      uses_saving_.store(false, std::memory_order_release);
+    }).detach();
+  }
+
+  // The start-up gate: pipelines the last runs used are still compiling (--gtav_native_warm_gate_s).
+  bool GateActive() const {
+    return gate_left_.load(std::memory_order_acquire) != 0 && std::chrono::steady_clock::now() < gate_until_;
+  }
+  uint32_t GateLeft() const { return GateActive() ? gate_left_.load(std::memory_order_acquire) : 0; }
+  // Pipelines the warm-up compiled since the last call (they are in the Vulkan pipeline cache too).
+  uint32_t TakeCompiled() { return compiled_new_.exchange(0, std::memory_order_acq_rel); }
 
   // Appends a pipeline first created this run.
   void Note(uint64_t key, uint64_t vs, uint64_t ps, const std::vector<uint8_t>& bytes) {
@@ -1243,6 +1385,7 @@ class PipelineWarmer {
     }
     records_.erase(it);
     remaining_.store(uint32_t(records_.size()), std::memory_order_release);
+    if (rec->state == kQueued) GateDone(*rec);  // the caller compiles it now
     rec->state = kTaken;  // a queued record is skipped by the workers
     if (rec->bytes != bytes) {
       if (++mismatched_ <= 5)
@@ -1261,7 +1404,46 @@ class PipelineWarmer {
     std::vector<uint8_t> bytes;
     State state = kQueued;
     std::unique_ptr<RenderPipeline> result;
+    uint32_t last_run = 0;  // the last run that used it (0: none since the list keeps track)
+    uint32_t order = 0;     // its place among that run's pipelines (never used: among the file's records)
+    bool priority = false;  // used in the last three runs: part of the start-up gate
   };
+  struct Use {
+    uint32_t run = 0, order = 0;
+  };
+  static constexpr uint32_t kUsedMagic = 0x31554C47;  // "GLU1"
+
+  // pipelines_used.bin: magic, the run number, then (key, run, order) per pipeline.
+  void LoadUses() {
+    std::vector<uint8_t> data;
+    if (FILE* f = std::fopen(used_file_.string().c_str(), "rb")) {
+      std::fseek(f, 0, SEEK_END);
+      data.resize(size_t(std::max(0L, std::ftell(f))));
+      std::fseek(f, 0, SEEK_SET);
+      if (std::fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+      std::fclose(f);
+    }
+    uint32_t head[2] = {};
+    if (data.size() >= 8) std::memcpy(head, data.data(), 8);
+    if (head[0] != kUsedMagic) return;  // run_ stays 1
+    run_ = head[1] + 1;
+    for (size_t at = 8; at + 16 <= data.size(); at += 16) {
+      uint64_t key;
+      Use use;
+      std::memcpy(&key, &data[at], 8);
+      std::memcpy(&use, &data[at + 8], 8);
+      if (known_.count(key) && use.run < run_) uses_[key] = use;
+    }
+  }
+
+  // (under mutex_) a gate record is compiled, or the frame took it over.
+  void GateDone(Record& rec) {
+    if (!rec.priority) return;
+    rec.priority = false;
+    if (gate_left_.load(std::memory_order_acquire) && gate_left_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+      REXLOG_INFO("[native] pipeline warm-up: the {} pipelines of the last runs are ready after {:.1f} s",
+                  first_total_, std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count());
+  }
 
   const RenderShader* LoadShader(uint64_t hash, bool pixel) {
     if (!hash) return nullptr;
@@ -1294,7 +1476,12 @@ class PipelineWarmer {
     // first 0.5.0 launch skipped draws for 95 s, up to 1,446 of ~2,600 a frame. Below the frame's
     // class, and no warm-up compile starts while one of the frame's is queued or running: the
     // warm-up fills the time the frame does not need the compiler.
-    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    // 11-27: the list had grown to 2,644 pipelines on the owner's phone, and with a cold Metal
+    // cache (11-24 to 11-26, after updates) frames kept losing draws to pipelines not compiled
+    // yet for about seven minutes. The ones the last runs used (the start-up gate) now compile at
+    // the class below the frame's; only the rest stays at the background class. Both still stand
+    // aside for the frame's own compiles.
+    int qos = 0;
 #endif
     for (;;) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -1302,6 +1489,7 @@ class PipelineWarmer {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
 #endif
       std::shared_ptr<Record> rec;
+      bool first = false;
       {
         std::lock_guard lock(mutex_);
         while (!queue_.empty() && !rec) {
@@ -1311,7 +1499,16 @@ class PipelineWarmer {
         }
         if (!rec) break;
         rec->state = kCompiling;
+        first = rec->priority;
       }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+      if (const int want = first ? 2 : 1; want != qos) {
+        qos = want;
+        pthread_set_qos_class_self_np(first ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY, 0);
+      }
+#else
+      (void)first;
+#endif
       RenderGraphicsPipelineDesc desc;
       std::vector<RenderInputElement> elements;
       std::vector<RenderInputSlot> slots;
@@ -1342,8 +1539,10 @@ class PipelineWarmer {
       {
         std::lock_guard lock(mutex_);
         compiled_ += pipeline != nullptr;
+        compiled_new_.fetch_add(pipeline != nullptr, std::memory_order_acq_rel);
         rec->result = std::move(pipeline);
         if (rec->state == kCompiling) rec->state = kDone;
+        GateDone(*rec);
       }
       cv_.notify_all();
     }
@@ -1373,6 +1572,16 @@ class PipelineWarmer {
   std::atomic<uint32_t> remaining_{0};  // records not yet taken
   uint32_t total_ = 0, compiled_ = 0;
   std::chrono::steady_clock::time_point start_;
+  // Uses (render thread only, apart from the file write): which run needed each pipeline last.
+  std::filesystem::path used_file_;
+  std::unordered_map<uint64_t, Use> uses_;
+  uint32_t run_ = 1, use_order_ = 0, first_total_ = 0;
+  bool uses_dirty_ = false;
+  std::chrono::steady_clock::time_point uses_saved_;
+  std::atomic<bool> uses_saving_{false};
+  std::atomic<uint32_t> gate_left_{0};  // gate records still queued or compiling
+  std::chrono::steady_clock::time_point gate_until_;
+  std::atomic<uint32_t> compiled_new_{0};
 
  public:
   uint32_t used_ = 0, mismatched_ = 0;
@@ -1563,6 +1772,9 @@ class HashPool {
         }
 #endif
         uint64_t seen = 0;
+#if defined(__APPLE__)
+        int qos = 0;
+#endif
         for (;;) {
           {
             std::unique_lock lock(mutex_);
@@ -1570,6 +1782,16 @@ class HashPool {
             if (stop_) return;
             seen = generation_;
           }
+#if defined(__APPLE__)
+          if (const int want = REXCVAR_GET(gtav_native_hash_qos); want != qos) {  // live
+            qos = want;
+            pthread_set_qos_class_self_np(want == 1   ? QOS_CLASS_UTILITY
+                                          : want == 2 ? QOS_CLASS_USER_INITIATED
+                                          : want == 3 ? QOS_CLASS_USER_INTERACTIVE
+                                                      : QOS_CLASS_DEFAULT,
+                                          0);
+          }
+#endif
           Work();
         }
       });
@@ -2229,9 +2451,19 @@ struct Backend::Impl {
   // A draw whose pipeline is still compiling in the background waits for it while this frame's
   // budget (--gtav_native_pipeline_wait_ms) lasts: a skipped draw is a one-frame hole (a car
   // vanishing, the sky going dark). Only compiles longer than the budget still skip.
+  // The frame's whole budget. While the last complete frame is being repeated this one is not
+  // shown, so it waits longer (--gtav_native_hold_wait_ms): more of its pipelines arrive per frame
+  // and the game does not run on under a frozen picture. Once the repeat is used up frames with
+  // holes are shown live, and waiting 40 ms in each for compiles that take a second only slowed them.
+  double PipelineWaitBudget() const {
+    const double wait = REXCVAR_GET(gtav_native_pipeline_wait_ms);
+    if (held_run) return std::max(wait, REXCVAR_GET(gtav_native_hold_wait_ms));
+    if (hold_spent) return std::min(wait, 5.0);
+    return wait;
+  }
   bool WaitForJob(const PipelineJob& job) {
     if (job.done.load(std::memory_order_acquire)) return true;
-    double budget = REXCVAR_GET(gtav_native_pipeline_wait_ms) - pipeline_wait_ms;
+    double budget = PipelineWaitBudget() - pipeline_wait_ms;
     if (budget <= 0) return false;
     auto start = std::chrono::steady_clock::now();
     bool done = false;
@@ -3756,10 +3988,11 @@ struct Backend::Impl {
       PipelineBytesWriter w;
       uint8_t has_gs = desc.geometryShader != nullptr;
       PipelineFields(w, desc, elements, slots, sc, has_gs);
+      pipeline_warmer.Used(key);
       if (pipeline_warmer.Active()) {
         bool busy = false;
-        auto warmed = pipeline_warmer.Take(key, w.out, REXCVAR_GET(gtav_native_pipeline_wait_ms) - pipeline_wait_ms,
-                                           &pipeline_wait_ms, &busy);
+        auto warmed = pipeline_warmer.Take(key, w.out, PipelineWaitBudget() - pipeline_wait_ms, &pipeline_wait_ms,
+                                           &busy);
         if (warmed) return (pipelines[key] = std::move(warmed)).get();
         if (busy) return nullptr;
       }
@@ -6415,6 +6648,8 @@ struct Backend::Impl {
   std::unique_ptr<RenderTextureView> held_view;
   uint32_t held_descriptor = 0, held_width = 0, held_height = 0, held_frames = 0, held_run = 0;
   bool hold_spent = false;  // the hold ran out during this run of lost frames: live frames until a complete one
+  std::chrono::steady_clock::time_point held_since;  // start of this run of repeated frames
+  uint32_t shown_with_holes = 0;                     // frames shown with draws missing (the flicker count)
   RenderFormat held_format = RenderFormat::UNKNOWN;
   bool held_valid = false;
   RenderTexture* HoldFront(RenderCommandList* list, ResolvedTexture& front, bool lost, uint32_t* descriptor) {
@@ -6425,18 +6660,32 @@ struct Backend::Impl {
     // A long run of lost frames (a loading burst, or one pipeline the iPhone's Metal compiler took
     // 30 s over) shows live frames once the hold is used up, until a complete frame arrives. (It used
     // to show one live frame and hold again: 60 frozen, 1 live, a frame a second for as long as the
-    // compile took.) Phones hold for half a second, desktops for one.
-    if (!lost) hold_spent = false;
-    if (lost && held_valid && !hold_spent && held_run >= uint32_t(std::max(1, REXCVAR_GET(gtav_native_hold_max_frames))))
+    // compile took.) Desktops hold for one second.
+    // iPhone (11-27): the repeat lasts at least --gtav_native_hold_max_ms as well, and for as long
+    // as the start-up gate is up (the pipelines of the last runs are compiling) it does not run
+    // out at all: after an install the first sight of the world waits for its pipelines under a
+    // "Preparing shaders" line instead of appearing piece by piece.
+    const auto now = std::chrono::steady_clock::now();
+    const double held_ms = held_run ? std::chrono::duration<double, std::milli>(now - held_since).count() : 0;
+    if (lost && held_valid && !hold_spent && !pipeline_warmer.GateActive() &&
+        held_run >= uint32_t(std::max(1, REXCVAR_GET(gtav_native_hold_max_frames))) &&
+        held_ms >= REXCVAR_GET(gtav_native_hold_max_ms))
       hold_spent = true;
+    if (held_run && (!lost || hold_spent))
+      REXLOG_INFO("[native] hold over: the last complete frame stayed up for {} frames, {:.0f} ms{}", held_run,
+                  held_ms, hold_spent ? " (frames with draws missing are shown from here)" : "");
+    if (!lost) hold_spent = false;
     if (lost && held_valid && !hold_spent) {
-      held_run++;
+      if (!held_run++) held_since = now;
       if (++held_frames <= 10 || held_frames % 100 == 0)
         REXLOG_INFO("[native] frame lost draws: showing the previous frame instead ({} so far)", held_frames);
       *descriptor = held_descriptor;
       return held.get();
     }
     held_run = 0;
+    // Shown with draws missing (no complete frame yet, or the repeat ran out): it is not kept as
+    // the frame to repeat.
+    if (lost) return nullptr;
     if (!held || held_width != front.width || held_height != front.height || held_format != front.format) {
       if (held) {
         layouts.erase(held.get());
@@ -7073,6 +7322,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.lost_pipeline = s.lost_vs = s.lost_ps = 0;
   s.pipeline_wait_ms = 0;
   s.lost_first.clear();
+  s.pipeline_warmer.Tick();
   if (f.index % 150 == 0)
     REXLOG_INFO("[native] replay frame {}: {} drawn, {} skipped, {} new pipelines ({} total), {} texture uploads, "
                 "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached",
@@ -7101,6 +7351,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.DumpTexture(list, r->descriptor, uint32_t(r->format), r->width, r->height, 0xFFFF0000, 0xF0F0F0, none);
     }
     if (RenderTexture* held = s.HoldFront(list, *r, lost, front_descriptor)) return held;
+    // The acceptance count for "no flicker": every frame that reached the screen incomplete.
+    if (lost)
+      REXLOG_INFO("[native] frame {} shown with missing draws ({} so far)", f.index, ++s.shown_with_holes);
     *front_descriptor = r->descriptor;
     return r->texture.get();
   }
@@ -7125,6 +7378,14 @@ bool Backend::Dumping() const { return impl_->dumping; }
 void Backend::RequestDump() { impl_->dump_request = true; }
 
 const std::vector<Backend::DrawNote>& Backend::LastNotes() const { return impl_->notes; }
+
+uint32_t Backend::Preparing() const {
+  const uint32_t gate = impl_->pipeline_warmer.GateLeft();
+  if (!impl_->held_run && !gate) return 0;
+  return std::max(1u, gate + uint32_t(std::max(0, impl_->pipeline_compiler.outstanding.load(std::memory_order_acquire))));
+}
+
+uint32_t Backend::TakeWarmCompiled() { return impl_->pipeline_warmer.TakeCompiled(); }
 
 Backend::FrameStats Backend::LastStats() const {
   return {impl_->stat_draws, impl_->stat_skipped, impl_->stat_pipelines_created, impl_->stat_textures,

@@ -432,6 +432,28 @@ extern "C" int gtav_ios_battery(int* charging) {
   return level.load(std::memory_order_relaxed);
 }
 
+// GTAV_IOS_CLEAR_METAL_CACHE (test, native/renderer.cpp): Metal keeps the compiled shaders of this
+// app in Library/Caches/.../com.apple.metal. Called before main. Returns the bytes removed.
+extern "C" long long gtav_ios_clear_metal_cache() {
+  NSFileManager* fm = NSFileManager.defaultManager;
+  NSString* caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+  if (!caches) return 0;
+  NSMutableArray<NSString*>* found = [NSMutableArray array];
+  NSDirectoryEnumerator* walk = [fm enumeratorAtPath:caches];
+  for (NSString* rel in walk) {
+    if (![rel.lastPathComponent isEqualToString:@"com.apple.metal"]) continue;
+    [found addObject:[caches stringByAppendingPathComponent:rel]];
+    [walk skipDescendants];
+  }
+  long long bytes = 0;
+  for (NSString* dir in found) {
+    for (NSString* rel in [fm enumeratorAtPath:dir])
+      bytes += [[fm attributesOfItemAtPath:[dir stringByAppendingPathComponent:rel] error:nil] fileSize];
+    [fm removeItemAtPath:dir error:nil];
+  }
+  return bytes;
+}
+
 // BC (DXT) textures on this GPU (iOS 16.4+ reports it per device; MoltenVK passes it through as
 // textureCompressionBC): without it native/textures.cpp decodes them on the CPU.
 extern "C" int gtav_ios_supports_bc() {
